@@ -1,0 +1,57 @@
+- slug: deep-dive-checklist
+  day: 29
+  title: The deep-dive checklist
+  minutes: 11
+  summary: "A checklist of the questions a bar raiser asks about any component, so you can take one part of your design from a box to a defensible plan."
+  plain: |
+    The **deep dive** is the part of the interview where you take one component of your design and go from "a box labelled cache" to exactly how it works, how big it is, how it fails, and how you would know. A **bar raiser** is an interviewer, often from another team, whose job is to hold the hiring bar high; they tend to push hardest here.
+
+    Think of a building inspector. An architect's sketch shows rooms and doors. The inspector asks: how thick is this beam, what load does it carry, where does water drain, what happens in a fire, where are the exits? The deep dive is your design meeting the inspector.
+
+    The good news is that the inspector's questions are predictable. Almost every deep dive touches the same handful of themes:
+    - **Data**: what is stored, in what shape, under which key, and how big it gets.
+    - **Access patterns**: which queries run, how often, and how fast they must be.
+    - **Scale**: what happens at ten times the traffic, and where the first limit is.
+    - **Consistency**: who sees which version of the data, and when.
+    - **Failure**: what happens when this part crashes, slows down, or loses its network.
+    - **Operations**: how you deploy it, monitor it and recover it.
+
+    Go through these in order for the component you picked, and you will rarely be caught without an answer. You do not need to cover every item every time; the checklist is there so that nothing important is missed when the pressure is on, the way pilots use a checklist even after thousands of flights.
+  deeper: |
+    ### The checklist
+    | Theme | Questions to answer before they are asked |
+    |---|---|
+    | Data model | entities and keys; partition key and sort key; row size; growth per year; hot keys |
+    | Access patterns | top 3 queries with QPS and latency target; indexes that serve them; which query is scatter-gather |
+    | Capacity | peak load vs per-node capacity; node count at 60% utilisation; headroom for one node or AZ lost |
+    | Consistency | strong or eventual, per operation; read-your-writes; ordering scope (global, per key, none) |
+    | Concurrency | concurrent updates to one record: lock, CAS, last-writer-wins, CRDT; idempotency of retries |
+    | Caching | what is cached, TTL, invalidation on write, hit ratio target, stampede protection, cold start |
+    | Failure | node crash, slow node, network partition, dependency down; detection time, blast radius, RTO and RPO |
+    | Overload | rate limits, backpressure, timeouts, retries with jitter, circuit breakers, load shedding order |
+    | Evolution | resharding, schema migration, backfill, rolling deploys without downtime |
+    | Observability | RED metrics per endpoint, saturation of this component, the alert that would page and its runbook |
+    | Security and cost | who can read and write it; encryption; the biggest line item and how to shrink it |
+
+    ### Deep dives bar raisers ask for, by problem
+    - **Feed**: celebrity fan-out, timeline cache size and eviction, ranking latency budget, backfill for new follows.
+    - **Chat**: per-conversation ordering, delivery receipts and retries, offline sync, presence at 100M connections.
+    - **Payments**: idempotency key storage and concurrency, ledger invariants, external processor timeouts, reconciliation.
+    - **Top-K**: window semantics, late events, hot keys, exact vs approximate and the error bound.
+    - **Rate limiter**: algorithm (token bucket vs sliding window), distributed counters, behaviour when Redis is down (fail open or closed).
+    - **Ride matching**: location write rate, geo-index choice, double-booking prevention, hot cells.
+    - **Video**: transcoding DAG and retries, ladder choice, CDN hit ratio and egress cost.
+
+    ### Worked mini-dive: the timeline cache
+    "Key `timeline:{user_id}` -> list of up to 800 tweet ids, 16 B each, ~13 KB per user; 200M users = 2.6 TB, about 40 primaries of 64 GB, 80 nodes with one replica each. Writes: 1M inserts/s via fan-out workers, pipelined. Reads: 60k/s at peak, LRANGE 0..19, sub-ms. Inactive users (no login in 30 days) are evicted and rebuilt on demand from the follow graph — costly but rare. On shard loss, reads fall back to pull-based assembly for affected users, at a latency cost; alert on fallback rate. Celebrity tweets are not fanned out; merged at read time."
+
+    That one paragraph touches data, size, capacity, access, failure and observability. That density is what the bar is.
+
+    ### How to pick and pace
+    Spend 2–3 minutes per theme at most, and skip themes that do not apply. Lead with the theme where this component is weakest; volunteering the weakness and its mitigation is a stronger signal than waiting to be caught.
+  key_points:
+    - "A deep dive takes one component from a box to its data model, access patterns, capacity, consistency, failure and operations."
+    - "Bar-raiser questions are predictable; walk the checklist so nothing important is missed under pressure."
+    - "Answer with numbers: sizes, node counts at 60% utilisation, QPS, detection time and blast radius."
+    - "Lead with the component's weakest point and your mitigation instead of waiting to be caught."
+  concepts: [deep-dive, failure-analysis, capacity-planning, data-modeling]

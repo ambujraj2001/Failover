@@ -1,0 +1,178 @@
+- slug: timeouts-and-retries
+  day: 13
+  title: Timeouts, retries and backoff
+  minutes: 10
+  summary: Every remote call needs a timeout, and retries must back off with jitter and stay within a budget, or a small slowdown becomes a self-inflicted outage.
+  plain: |
+    You phone a shop and nobody answers. How long do you let it ring? If you never hang up, you
+    wait forever and cannot call anyone else. That is why every call between services needs a
+    **timeout**: a maximum time to wait before giving up.
+
+    Without timeouts, a slow **dependency** (another service or database your service calls) makes
+    your service slow too. Each waiting request holds a **thread** (a worker inside the server that
+    handles one request at a time). When all threads are stuck waiting, your service cannot accept
+    new requests, even ones that do not need the slow dependency. One slow database takes down
+    everything in front of it.
+
+    After a timeout or error, it is natural to **retry**: try again. Retries are great for brief
+    glitches. They are dangerous when the dependency is overloaded. Imagine a shop whose phone line
+    is jammed because too many people are calling. If everyone who fails immediately calls again,
+    and again, the line stays jammed forever. This is a **retry storm**: retries multiply the load
+    on exactly the system that is already struggling.
+
+    Three habits make retries safe:
+
+    - **Backoff**: wait before retrying, and wait longer each time: 100 ms, then 200, then 400. This
+      is **exponential backoff**.
+    - **Jitter**: add randomness to the wait, so a thousand clients do not all retry at the same
+      instant.
+    - **Limit**: retry only a couple of times, and only for operations that are safe to repeat
+      (**idempotent**). Reading is safe. Charging a card is safe only with an idempotency key.
+
+    A good rule: fail fast, retry a little, and wait politely between attempts.
+  deeper: |
+    ### Picking a timeout
+    Base it on the dependency's latency distribution, not a round number: roughly its p99.9 plus a
+    margin, and always less than the caller's own remaining deadline. A 30 s default library timeout
+    on a call whose p99 is 40 ms is the classic root cause of thread exhaustion.
+
+    By Little's law, an instance with 128 threads whose calls hang for a 10 s timeout can sustain
+    only `128 / 10 = 12.8 rps`. With a 200 ms timeout it sustains 640 rps of failures and stays
+    responsive for everything else. The simulator models exactly this in-flight limit.
+
+    ### Deadline propagation
+    Pass the remaining budget down the call chain (gRPC deadlines, an `x-request-deadline` header).
+    If the edge allows 1 s and 700 ms are gone, the next hop gets 300 ms, and a service whose deadline
+    has passed drops the work instead of computing a response nobody will read.
+
+    ### Retry amplification
+    Retries multiply across layers:
+    ```
+    3 layers, each doing 1 try + 2 retries  ->  3 x 3 x 3 = 27 attempts at the bottom
+    ```
+    Retry at one layer only, usually the one closest to the user or the one with the most context.
+
+    ### Backoff with jitter
+    ```python
+    def backoff(attempt, base=0.1, cap=5.0):
+        # "full jitter": uniform between 0 and the exponential ceiling
+        return random.uniform(0, min(cap, base * 2 ** attempt))
+    ```
+    Full jitter spreads retries evenly and, in AWS's published analysis, completes work with less
+    total load than equal or no jitter.
+
+    ### Retry budgets
+    Cap retries as a fraction of traffic, for example retries may add at most 10% to request volume
+    (Finagle and Envoy support this). When the dependency is healthy, nearly every retry is
+    permitted; when it is failing broadly, the budget empties and retries stop adding load.
+
+    ### What to retry
+    | Retry | Do not retry |
+    |---|---|
+    | connection refused/reset, 502/503/504, timeouts on idempotent calls | 400, 401, 403, 404, 409, 422 |
+    | 429 after `Retry-After` | non-idempotent writes without an idempotency key |
+
+    ### Failure modes
+    - Retries on timeouts where the first attempt actually succeeded: duplicates.
+    - Synchronized retries after an outage: every client's backoff timer fires together on recovery.
+    - Client timeout shorter than the server's work: the server keeps working on abandoned requests.
+
+    Interviewers probe for retry amplification, jitter, budgets, and the link between timeout length
+    and thread exhaustion.
+  key_points:
+    - "Every remote call needs a timeout set from the dependency's tail latency, shorter than the caller's remaining deadline."
+    - "Long timeouts exhaust threads: in-flight = rate x latency, so slow calls cap throughput."
+    - "Use exponential backoff with full jitter, a small attempt limit, and retry only idempotent operations."
+    - "Retries multiply across layers; retry at one layer and enforce a retry budget."
+    - "Propagate deadlines so downstream services drop work whose caller has already given up."
+  concepts: [timeouts, exponential-backoff, jitter, retry-storms, retry-budgets]
+
+- slug: circuit-breakers-and-bulkheads
+  day: 13
+  title: Circuit breakers and bulkheads
+  minutes: 10
+  summary: A circuit breaker stops calling a dependency that keeps failing, and bulkheads give each dependency its own capacity, so one failure cannot sink the whole service.
+  plain: |
+    Your house has a **circuit breaker** in the fuse box. If a faulty kettle draws too much current,
+    the breaker trips and cuts power to that circuit. The kettle stops, but the fridge and lights on
+    other circuits keep working, and the wiring does not catch fire. Later you reset the breaker.
+
+    Software circuit breakers do the same for calls to a **dependency** (another service). The
+    breaker watches the results of recent calls:
+
+    - **Closed** (normal): calls go through.
+    - **Open** (tripped): too many recent calls failed, so the breaker stops making them. Requests
+      fail immediately, or get a fallback answer, without waiting for a timeout. The struggling
+      service gets breathing room to recover.
+    - **Half-open** (testing): after a pause, a few trial calls are let through. If they succeed,
+      the breaker closes again. If they fail, it opens again.
+
+    A **bulkhead** comes from ships. A ship's hull is split into watertight compartments, so a hole
+    floods one compartment and the ship stays afloat. In software, you split your server's capacity,
+    for example its **threads** or connections, into separate pools per dependency. If the
+    recommendations service hangs, it can use up only its own pool of 20 threads. The checkout pool
+    is untouched, and customers can still pay.
+
+    Both ideas lead to **graceful degradation**: when part of the system fails, the rest keeps
+    working with reduced features. A shop page without personalised recommendations is fine. A shop
+    page that will not load because recommendations are down is an outage.
+
+    The question to ask for every dependency: "if this is slow or down, what should the user see?"
+  deeper: |
+    ### Breaker mechanics
+    ```
+    CLOSED --(error rate > 50% over last 20 calls, min volume met)--> OPEN
+    OPEN   --(after 10-30 s cool-down)----------------------------> HALF_OPEN
+    HALF_OPEN --(N trial calls succeed)--> CLOSED
+    HALF_OPEN --(any trial fails)--------> OPEN
+    ```
+    Count timeouts and 5xx as failures; do not count 4xx. Require a minimum request volume so three
+    failures at 3 am do not trip it. Breakers live per client instance (Resilience4j, Polly) or in a
+    service mesh (Envoy outlier detection, which ejects individual unhealthy hosts rather than the
+    whole service).
+
+    ### Why breakers help the caller too
+    An open breaker fails in microseconds instead of holding a thread for the full timeout. With 128
+    threads and a 2 s timeout, a dead dependency caps the instance at 64 rps for every endpoint that
+    shares those threads. With the breaker open, the threads stay free.
+
+    ### Bulkheads, sized
+    Partition threads, connection pools or concurrency limits per dependency, sized by Little's law:
+
+    ```
+    pool size ≈ peak rps to dependency x p99 latency x 1.5
+    recommendations: 300 rps x 0.05 s x 1.5 ≈ 23 slots
+    payments:        80 rps x 0.3 s x 1.5  ≈ 36 slots
+    ```
+    When a pool is full, reject immediately (or fall back) instead of queueing. The same idea at
+    larger scale: separate instance pools or clusters for critical and non-critical traffic, or
+    per-tenant isolation (cell architecture), so a noisy tenant cannot exhaust shared capacity.
+
+    ### Load shedding
+    When the service itself is overloaded, reject excess work early and cheaply (503 with
+    `Retry-After`) based on in-flight count or queue age, prioritising critical requests. Serving 80%
+    of requests well beats serving 100% so slowly that clients time out on all of them.
+
+    ### Fallbacks
+    | Dependency down | Fallback |
+    |---|---|
+    | recommendations | popular items from a static list |
+    | profile service | cached profile, possibly stale |
+    | pricing | fail the request; a wrong price is worse than an error |
+
+    ### Failure modes
+    - A breaker that trips on a single bad host takes the whole service out; prefer per-host ejection.
+    - Fallbacks that call another fragile dependency, or that are never exercised and break silently.
+    - Every instance's breaker half-opens at the same moment, sending a synchronized burst to a
+      recovering service; add jitter to cool-down.
+
+    Interviewers look for breaker states and thresholds, bulkheads sized by Little's law, a
+    deliberate fallback per dependency, and the distinction between per-client rate limits and
+    self-protective load shedding.
+  key_points:
+    - "A circuit breaker opens after a failure threshold, fails fast while open, and probes in half-open before closing."
+    - "Failing fast frees threads that would otherwise wait out the timeout, protecting the caller."
+    - "Bulkheads give each dependency a bounded pool sized by rate x latency, so one slow dependency cannot exhaust all capacity."
+    - "Load shedding rejects excess work early under overload; serving most requests well beats serving all badly."
+    - "Decide a fallback per dependency; for some (prices, payments) failing is the correct fallback."
+  concepts: [circuit-breaker, bulkhead-pattern, load-shedding, graceful-degradation]

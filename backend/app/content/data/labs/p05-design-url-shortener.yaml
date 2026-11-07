@@ -1,0 +1,240 @@
+slug: design-url-shortener
+kind: problem
+title: Design a URL shortener
+difficulty: easy
+day: 5
+checkpoint: true
+summary: Design TinyURL end to end. A read-heavy redirect path, short-code generation, and a cache that has to survive a restart.
+topics: [url-shortener, caching, cache-aside, id-generation, read-heavy, estimation]
+company_tags: [Google, Meta, Amazon, Microsoft, Bitly, Uber]
+estimated_minutes: 45
+incident: "Launch review · 100M new links/month · 5,000 req/s at peak · design due Friday"
+
+brief_beginner: |
+  You are building **shrt.ly**, a link shortener. People paste a long, ugly link and get back a
+  short one like `shrt.ly/aZ3kQ9`. Later, anyone who opens the short link is sent on to the
+  original page. That "sending on" is called a **redirect**.
+
+  Think of it as a cloakroom ticket: you hand in a coat (the long URL), get a small ticket (the
+  short code), and anyone holding the ticket can collect the coat. Handing in coats is rare.
+  Collecting them happens all day: for every link someone creates, it gets opened about
+  **100 times**.
+
+  At launch you expect **5,000 requests per second** at peak. Right now the design is one app
+  server talking to one small database, and the database only knows how to find links by their
+  internal number (`id`), not by the short code people actually type. Every redirect makes it
+  search the whole table.
+
+  Two words you will need. A **cache** is a small, very fast memory that keeps recent answers so
+  you do not have to ask the database again. A **load balancer** spreads requests across several
+  copies of your app so no single copy is overwhelmed.
+
+  **Your job:** build a design that turns short codes into redirects quickly at 5,000 requests per
+  second, stays up when traffic jumps and when the cache restarts, and fits the budget. Then write
+  a short design note explaining how codes are generated and stored.
+
+brief_expert: |
+  **Functional:** `POST /links {long_url, custom_alias?, expires_at?}` → short code; `GET /:code`
+  → 301/302 to the long URL; optional expiry and custom aliases. Analytics are out of scope.
+
+  **Non-functional:** 100M new links/month (~40 writes/s average), 100:1 read:write, 5k rps peak on
+  the redirect path, p99 < 80 ms at the edge of our service, 99.9% availability, links retained
+  5 years.
+
+  **Scale:** 100M × 12 × 5 = 6B links × ~500 B ≈ 3 TB of rows. Hot set (links clicked this week)
+  ≈ 3 GB. Redirects are point lookups on `short_code`; ~10% of requests are static assets for the
+  create page.
+
+  The starter is one app instance on a small PostgreSQL that only indexes `id`. Fix the access
+  path, scale the stateless tier horizontally, and put a cache-aside tier in front of the
+  database. Budget rules out solving it with the largest database. Expect a traffic surge and a
+  cache restart in the hidden tests.
+
+glossary:
+  - term: Redirect (301 vs 302)
+    meaning: The server answers "go to this other address instead". 301 means permanent, so browsers remember it; 302 means temporary, so every click comes back to you (useful if you count clicks).
+  - term: Short code
+    meaning: The few characters after the slash, like aZ3kQ9. Seven base-62 characters (a-z, A-Z, 0-9) give 62^7 ≈ 3.5 trillion possible codes.
+  - term: Cache-aside
+    meaning: The app checks the cache first. On a miss it reads the database and stores the answer in the cache for next time.
+  - term: Index
+    meaning: A sorted lookup structure on a column, like the index at the back of a book. Without one, the database reads every row to find a match.
+  - term: Load balancer
+    meaning: A front door that spreads incoming requests across several identical app servers.
+
+requirements:
+  - p99 latency under 80 ms at 5,000 req/s
+  - Error rate under 0.5%
+  - Survive a 1.5x traffic surge and a cache restart
+  - Stay within $1.90/hr
+
+budget: 1.9
+palette: [load_balancer, app_server, database, cache, cdn]
+
+starter:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 160}}
+    - {id: api, type: app_server, label: API, config: {size: large, instances: 1}, position: {x: 240, y: 160}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: small, indexes: "id"}, position: {x: 480, y: 160}}
+  edges:
+    - {source: users, target: api}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: API, config: {size: large, instances: 8}, position: {x: 480, y: 160}}
+    - {id: redis, type: cache, label: Redis, config: {memory_gb: "4", ttl_s: 86400, stampede_protection: true}, position: {x: 720, y: 60}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: medium, indexes: "id, short_code"}, position: {x: 720, y: 260}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: redis}
+    - {source: api, target: db}
+
+tests:
+  - id: launch-peak
+    name: Launch-day peak
+    summary: 5,000 req/s, 99% of dynamic traffic is redirects
+    scenario:
+      base_rps: 5000
+      read_ratio: 0.99
+      static_ratio: 0.1
+      working_set_gb: 3
+      query_column: short_code
+    assertions:
+      - {metric: p99_ms, op: lte, value: 80}
+      - {metric: error_rate, op: lte, value: 0.5}
+  - id: viral-link
+    name: A link goes viral
+    summary: Traffic climbs 50% for 20 seconds
+    hidden: true
+    scenario:
+      base_rps: 5000
+      read_ratio: 0.99
+      static_ratio: 0.1
+      working_set_gb: 3
+      query_column: short_code
+      spikes: [{at: 20, duration: 20, multiplier: 1.5, ramp: 4}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 160}
+      - {metric: error_rate, op: lte, value: 0.5}
+  - id: cache-restart
+    name: Redis restarts at peak
+    summary: The cache comes back empty at t=25s
+    hidden: true
+    scenario:
+      base_rps: 5000
+      read_ratio: 0.99
+      static_ratio: 0.1
+      working_set_gb: 3
+      query_column: short_code
+      events: [{at: 25, type: cache_flush}]
+    assertions:
+      - {metric: error_rate, op: lte, value: 1.0}
+
+hints:
+  - Start with the database. Redirects look links up by short code. Check which columns PostgreSQL has an index on, and what one unindexed lookup costs compared to an indexed one.
+  - A single app instance tops out at 1,000 units of work per second, and users wired straight to an app server only ever reach one instance. Put a load balancer in front and size the tier so it runs around 60% busy at peak, leaving room for a surge.
+  - Redirect targets never change once written, so they cache perfectly. Add Redis with App → Redis and keep App → PostgreSQL for misses and new links. Give it a long TTL, then work out what PostgreSQL sees in the first seconds after Redis restarts empty.
+
+design_prompt: |
+  Answer in writing. Use numbers where you can.
+
+  1. **API.** Define the create and redirect endpoints: methods, request and response bodies, and
+     status codes. Would you return 301 or 302 for redirects, and what does that choice cost or buy
+     you (caching by browsers, click analytics)?
+  2. **Short-code generation.** Pick one scheme (hash of the URL truncated, random base-62, or a
+     counter / pre-allocated ID ranges encoded in base-62) and justify it. How many characters do
+     you need for 6B links over 5 years? How do you avoid or handle collisions, and how does ID
+     generation work with several app servers running at once without a single point of failure?
+  3. **Data model and storage.** Give the table or key-value schema and the indexes. Estimate total
+     storage over 5 years. Would you use SQL or a key-value store, and how would you partition it if
+     one node is not enough?
+  4. **Caching.** Describe the read path with cache-aside: what is the key, what is the TTL, how big
+     must the cache be, and what is your expected hit ratio? What happens to the database when the
+     cache restarts empty, and how do you prevent a stampede?
+  5. **Edge cases.** How do you handle custom aliases that are already taken, expired links, the
+     same long URL submitted twice, and abuse (people shortening malware links)?
+
+editorial: |
+  ### 1. Requirements
+  * **Functional:** create a short link (optional custom alias and expiry), redirect a short link.
+  * **Non-functional:** redirects are latency-sensitive and must be highly available; creates can
+    be a little slower. Links must not collide and must not change once issued.
+  * **Out of scope (say so):** analytics dashboards, user accounts, link editing.
+
+  ### 2. Estimation
+  | quantity | value |
+  |---|---|
+  | new links | 100M / month ≈ 40 writes/s average, ~100/s peak |
+  | redirects | 100 × writes ≈ 4k/s average, 5k/s at peak |
+  | 5-year rows | 100M × 60 = 6B |
+  | row size | ~500 B (code, long URL, created_at, expires_at, owner) |
+  | storage | 6B × 500 B ≈ 3 TB (plus indexes) |
+  | code length | 62^6 ≈ 57B, 62^7 ≈ 3.5T → 7 characters leave ample room |
+  | hot set | ~1% of links get almost all clicks → a few GB fits in one Redis node |
+
+  ### 3. High-level design
+  ```
+  Users → LB → API (×8, stateless) ─┬─► Redis   (GET code → long URL, TTL 24 h)
+                                     └─► PostgreSQL (links table, index on short_code)
+  ```
+  * **Redirect:** `GET /aZ3kQ9` → Redis hit (~1 ms) → 302. On a miss read PostgreSQL by
+    `short_code`, fill Redis, redirect.
+  * **Create:** allocate an ID, encode it in base-62, `INSERT`, return the code. Writes go straight to
+    the database; at ~100/s they are not the bottleneck.
+
+  ### 4. Why the starter fails
+  Three separate problems, and the visible test exposes all of them:
+  1. **No index on `short_code`.** Each redirect scans the table: 15× the work and ~45 ms instead
+     of ~3 ms. A small PostgreSQL (600 lookups/s) can serve about 40 of those per second.
+  2. **One app instance.** 5,000 req/s of work against a 1,000/s instance. Users wired straight to
+     an app server only reach one instance, so you also need a load balancer.
+  3. **No cache.** Even indexed, ~4,500 reads/s is three times what a medium database can do.
+
+  ### 5. Deep dives
+  **Short-code generation.** Three common answers:
+  * *Hash (MD5/SHA) of the URL, take 7 chars:* deterministic, so the same URL dedupes for free, but
+    truncation collides, so you need check-and-retry on insert.
+  * *Random base-62:* simple, no coordination; collisions are rare at 6B / 3.5T but still need a
+    unique constraint and retry.
+  * *Counter encoded in base-62:* no collisions at all. To avoid a single counter bottleneck, each
+    app server leases a block of IDs (for example 10,000 at a time) from a coordinator such as
+    ZooKeeper or a database sequence. Codes are guessable in order; if that matters, permute the ID
+    with a reversible shuffle before encoding.
+
+  **Cache sizing.** 3 GB hot set, 4 GB node: full coverage, and with a long TTL the hit ratio is
+  ~98%. The database sees ~70 reads/s plus ~45 writes/s: under 10% of a medium node.
+
+  **Cold cache.** When Redis restarts, every redirect misses at once: ~4,500 reads/s onto a
+  database sized for a few hundred. Request coalescing (stampede protection) collapses concurrent
+  misses for the same key, cutting the storm by ~75% while the cache refills. The alternative is
+  keeping the database big enough to survive a cold start, which costs more every hour.
+
+  **301 vs 302.** 301 lets browsers cache the redirect, so repeat clicks never reach you (cheaper,
+  but you lose click counts and cannot change or expire the target). Most commercial shorteners use
+  302 for analytics.
+
+  ### 6. What the hidden tests probe
+  * **Viral link (1.5× for 20 s):** the app tier needs headroom. Eight large instances run at ~58%
+    normally and ~87% in the surge. Seven instances pass the visible test and collapse here.
+  * **Redis restarts:** without stampede protection the medium database is flooded for several
+    seconds. Fix with request coalescing or a larger database.
+
+  ### 7. Common mistakes
+  * Adding a cache but leaving the table unindexed: misses are 45 ms scans and a cold start is fatal.
+  * Several app instances wired directly from Users with no load balancer (only one gets traffic).
+  * A short TTL "for freshness". Links are immutable; TTL only needs to bound memory.
+  * Buying an xlarge database instead of a cache. It costs more and does not survive the next 2×.
+
+  ### 8. What good answers look like
+  * **E4:** correct API, base-62 counter or hash with collision handling, index plus cache-aside,
+    rough storage estimate.
+  * **E5:** numbers drive the design (QPS, storage, cache size, code length); distributed ID
+    allocation without a single point of failure; 301 vs 302 trade-off; cold-cache plan; custom
+    alias and expiry handling.
+  * **E6:** all of the above plus partitioning strategy for 3 TB (hash on `short_code`), multi-region
+    reads (replicate the immutable mapping everywhere, writes in one region), abuse and malware
+    scanning, and how analytics would be added asynchronously without slowing the redirect path.

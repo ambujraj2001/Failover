@@ -1,0 +1,96 @@
+- slug: sharding-and-shard-keys
+  day: 21
+  title: Sharding and choosing a shard key
+  minutes: 11
+  summary: "Splitting one database into many by a key, and why the choice of key decides whether load spreads evenly or piles onto one celebrity shard."
+  plain: |
+    When one database server cannot keep up with the writes, or cannot hold all the data, you split the data across several servers. Each piece is a **shard** (also called a **partition**), and each shard holds a subset of the rows. The **shard key** is the field that decides which shard a row lives on, such as `user_id`.
+
+    Think of a big library that outgrows one building. You split books across four buildings. If you split by the author's surname — A to F in building one, G to L in building two, and so on — that is **range sharding**. If you instead run each title through a formula that scatters books evenly regardless of name, that is **hash sharding**.
+
+    A good shard key spreads both data and traffic evenly, and keeps things that are read together on the same shard. Sharding by `user_id` keeps all of one user's orders together, so "show my orders" asks one shard instead of all of them.
+
+    The trouble starts with **hot keys**. If one author is wildly popular, everyone queues at the same building, no matter how many buildings you own. In a social app, a celebrity with 100 million followers sits on one shard; every like and comment on their posts hits that shard, and it melts while the others idle. That shard is a **hot partition**.
+
+    Range keys have a similar trap with time. Sharding by date means every new write goes to "today's" shard: one busy shard, many idle ones.
+  deeper: |
+    ### Range vs hash
+    | | Range | Hash |
+    |---|---|---|
+    | Range scans (`created_at BETWEEN`) | one or few shards | every shard (scatter-gather) |
+    | Even spread | only if keys are uniform | yes, for many distinct keys |
+    | Monotonic keys (time, auto-increment) | all writes on the last shard | spread |
+    | Rebalancing | split a range | needs consistent hashing or many fixed slots |
+
+    ### The hot shard math
+    With hash-by-user over N shards and one key carrying share `h` of traffic, the hottest shard carries `h + (1 - h) / N`. With h = 30% and N = 8, that is 30% + 8.75% = 38.75%: the hottest shard carries 3x its fair share, and adding shards barely helps because the 30% never moves. This is the formula the simulator uses for `hash_user`; `range_time` sends 100% of writes to one shard.
+
+    ### Fixing a hot key
+    - **Split the key**: append a suffix `post:123#0..15` so writes spread over 16 shards; reads gather 16 partial counts. The simulator's `hash_split_hot` models this, giving each shard ~1/N.
+    - **Absorb before the database**: buffer likes in a queue or in Redis counters and flush aggregates every second.
+    - **Cache the read side**: celebrity posts are read-heavy; serve them from cache and keep the DB for writes.
+    - **Dedicated shard**: isolate known whales on their own hardware.
+
+    ### Costs nobody mentions
+    - Cross-shard queries and joins become application code. Cross-shard transactions need sagas or 2PC.
+    - Global unique constraints (unique email) need a separate lookup table.
+    - Resharding is a migration project: dual writes, backfill, verification, cutover. Start with more logical shards than machines (say 1,024 slots on 8 hosts) so you move slots, not rows.
+    - Secondary indexes are either local (query all shards) or global (asynchronously maintained, eventually consistent).
+
+    ### When not to shard
+    Read replicas plus caching cover most read-heavy systems. A single large Postgres instance handles tens of thousands of writes/s and several TB. Shard when writes or data size truly exceed one primary, not earlier.
+
+    ### What interviewers probe
+    "What is your shard key and why?" "What is the access pattern it optimises, and which query becomes scatter-gather?" "What happens with a celebrity?" Answer with the key, the query it serves, and a hot-key mitigation.
+  key_points:
+    - "The shard key decides both data placement and which queries stay on one shard; pick it from the dominant access pattern."
+    - "Hash sharding spreads load but breaks range scans; range sharding keeps scans local but piles monotonic writes onto one shard."
+    - "A hot key carrying share h keeps the hottest shard at h + (1-h)/N; more shards cannot fix it, splitting the key can."
+    - "Shard late, and over-provision logical shards so rebalancing moves slots instead of rows."
+  concepts: [sharding, shard-key, hot-partition, range-partitioning, hash-partitioning]
+
+- slug: consistent-hashing
+  day: 21
+  title: Consistent hashing
+  minutes: 9
+  summary: "A way to map keys to servers so that adding or removing a server moves only a small fraction of keys instead of almost all of them."
+  plain: |
+    The obvious way to spread keys across servers is `server = hash(key) mod N`. It works until N changes. Go from 4 servers to 5 and almost every key maps to a different server: about 80% of a cache suddenly misses, or 80% of the data has to move.
+
+    **Consistent hashing** fixes this. Imagine a clock face, called the **ring**. Each server is placed at a few positions around the clock by hashing its name. Each key is also hashed to a position on the clock, and it belongs to the first server you reach walking clockwise from there.
+
+    Now add a fifth server. It lands at some points on the clock and takes over only the keys between itself and the previous server at each point. Everything else stays where it was. On average only one-fifth of the keys move — the share the new server should own. Remove a server and only its keys move, to its clockwise neighbours.
+
+    With only one position per server, the arcs between them are uneven, so some servers get far more keys than others. The fix is **virtual nodes**: each physical server is placed at many positions (often 100 or more). The many small arcs average out, and load becomes close to even. Virtual nodes also let a bigger machine take more positions and therefore more keys.
+
+    Consistent hashing is used by caches like Memcached clients, databases like Cassandra and DynamoDB, and load balancers that want the same user to keep hitting the same server.
+  deeper: |
+    ### Movement on resize
+    | Scheme | Keys moved when N goes 10 -> 11 |
+    |---|---|
+    | `hash mod N` | ~91% (only keys where `h mod 10 == h mod 11` stay) |
+    | Consistent hashing | ~1/11 = 9% |
+
+    ### Balance and virtual nodes
+    With one point per node, the largest arc is typically several times the average. With `v` virtual nodes per server, load standard deviation falls roughly as `1/sqrt(v)`; 100–200 vnodes keeps per-node load within about 10% of the mean. Cassandra historically used 256 vnodes per node and now defaults to 16 with a smarter token allocator, trading balance for faster repair and streaming.
+
+    ### Alternatives worth naming
+    - **Rendezvous (highest random weight) hashing**: for each key, score every server with `hash(key, server)` and pick the max. No ring, perfect balance, O(N) per lookup — fine for tens of servers.
+    - **Jump consistent hash** (Google): O(log N), zero memory, perfectly even, but servers must be numbered 0..N-1 and you can only add or remove at the end. Good for sharded storage, bad for caches where arbitrary nodes die.
+    - **Fixed slots**: Redis Cluster uses 16,384 hash slots assigned to nodes. Moving a slot is an explicit operation; the mapping is a small table. Most databases prefer this — it is simpler to reason about than a ring.
+    - **Bounded loads** (consistent hashing with load caps): a key spills to the next node if its owner is above, say, 1.25x average. Used by some L7 load balancers for sticky routing.
+
+    ### Hot keys are still hot
+    Consistent hashing balances *keys*, not *traffic*. One key with 30% of requests stays on one node. Replicate hot keys to several nodes or cache them in front.
+
+    ### Replication on a ring
+    Dynamo-style stores put each key on the next R distinct physical nodes clockwise (skipping vnodes on the same host, ideally on different racks or AZs). Quorum reads and writes (W + R > N) give tunable consistency.
+
+    ### What interviewers probe
+    "What fraction of keys moves when you add a node?" "Why virtual nodes?" "How do you handle a node with twice the memory?" (give it twice the vnodes or slots).
+  key_points:
+    - "hash mod N remaps almost every key when N changes; consistent hashing moves only about 1/N."
+    - "Virtual nodes smooth out uneven arcs and let bigger machines take a proportionally larger share."
+    - "Rendezvous, jump hash and fixed hash slots are common alternatives with different trade-offs."
+    - "Consistent hashing balances keys, not traffic; hot keys still need replication or caching."
+  concepts: [consistent-hashing, virtual-nodes, rendezvous-hashing, jump-hash, hash-slots]

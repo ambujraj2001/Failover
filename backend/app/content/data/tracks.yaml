@@ -1,0 +1,105 @@
+# Study plans. sequence: ordered lab/problem slugs.
+
+- slug: meta
+  name: Meta product and infra
+  tagline: Feeds, chat and real-time fan-out at billions of users.
+  description: "Built around the problems Meta-style loops favour: news feed fan-out, messaging delivery and ordering, live comments on hot streams and real-time aggregation. Expect deep dives on caching hot keys, celebrity skew and push infrastructure."
+  weeks: 4
+  focus:
+    - Fan-out on write vs read
+    - Real-time delivery (WebSockets, SSE)
+    - Caching and hot keys
+    - Sharding and celebrity skew
+    - Stream processing and top-k
+  sequence:
+    - one-server-one-bad-day
+    - redirects-melting-the-database
+    - design-url-shortener
+    - the-viral-spike
+    - stampede-at-the-top-of-the-hour
+    - the-write-burst
+    - design-chat-app
+    - design-news-feed
+    - design-live-comments
+    - design-top-k-trending
+    - the-celebrity-shard
+    - final-simulation
+
+- slug: google
+  name: Google scale and consistency
+  tagline: Collaboration, media and correctness at planetary scale.
+  description: "For Google-style interviews that reward rigour: consistency models and replication, consensus for collaborative editing, partitioning at huge scale and media delivery. Expect precise estimation and questions about what happens under partition."
+  weeks: 4
+  focus:
+    - Replication and consistency models
+    - Consensus, locks and collaborative editing
+    - Partitioning and consistent hashing
+    - Media pipelines and CDNs
+    - Capacity estimation
+  sequence:
+    - one-server-one-bad-day
+    - the-missing-index
+    - design-url-shortener
+    - reads-drowning-the-primary
+    - the-stale-profile
+    - stampede-at-the-top-of-the-hour
+    - primary-down-at-3am
+    - design-google-docs
+    - the-celebrity-shard
+    - design-youtube
+    - design-top-k-trending
+    - design-uber
+    - final-simulation
+
+- slug: amazon
+  name: Amazon reliability and commerce
+  tagline: Payments, queues and surviving the biggest day of the year.
+  description: "Centred on what Amazon-style loops probe: correctness of money movement, idempotency, asynchronous processing with queues, failure containment and operational excellence under extreme peaks. Expect questions on retries, failover and cost."
+  weeks: 4
+  focus:
+    - Idempotency, sagas and the outbox
+    - Queues and back-pressure
+    - Failover and redundancy
+    - Timeouts, retries and circuit breakers
+    - Rate limiting and abuse
+    - Cost-aware capacity planning
+  sequence:
+    - one-server-one-bad-day
+    - static-files-choking-the-api
+    - the-missing-index
+    - the-viral-spike
+    - reads-drowning-the-primary
+    - the-write-burst
+    - primary-down-at-3am
+    - the-scraper-flood
+    - the-retry-storm
+    - design-payment-system
+    - design-uber
+    - black-friday
+    - final-simulation
+
+- slug: crash
+  name: Two-week crash course
+  tagline: The highest-yield labs when the interview is close.
+  description: "A compressed path through the tools that solve most design problems: horizontal scaling, CDNs, indexes, caches, replicas, queues and failover, then three classic interview designs and the final simulation. One or two labs a day."
+  weeks: 2
+  focus:
+    - Scaling the stateless tier
+    - Caching and stampedes
+    - Database read and write scaling
+    - Failure handling
+    - Interview structure and estimation
+  sequence:
+    - one-server-one-bad-day
+    - static-files-choking-the-api
+    - redirects-melting-the-database
+    - design-url-shortener
+    - the-viral-spike
+    - reads-drowning-the-primary
+    - stampede-at-the-top-of-the-hour
+    - the-write-burst
+    - primary-down-at-3am
+    - the-retry-storm
+    - design-chat-app
+    - design-news-feed
+    - final-simulation

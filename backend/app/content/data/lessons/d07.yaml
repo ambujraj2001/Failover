@@ -1,0 +1,166 @@
+- slug: read-replicas
+  day: 7
+  title: Read replicas
+  minutes: 10
+  summary: Copies of the database that serve reads multiply read capacity, while all writes still go through one primary.
+  plain: |
+    A popular teacher has one copy of the answer key, and thirty students queue to check their
+    homework against it. The teacher photocopies the key three times and hands copies to three
+    helpers. Now four people can answer "is question 5 right?" at once. Only the teacher may
+    change the key, and after a change, the helpers' copies are briefly out of date until they get
+    new photocopies.
+
+    That is **replication**. The main database, called the **primary** (or leader), accepts all
+    changes. One or more **read replicas** (followers) receive a continuous stream of those changes
+    and apply them to their own copy. Your app sends:
+
+    - **writes** (create, update, delete) to the primary, and
+    - **reads** (most "show me" requests) to any replica.
+
+    This is called a **read/write split**. If your system reads ten times more than it writes,
+    which is very common, adding replicas multiplies the capacity where you need it.
+
+    Two catches.
+
+    First, the copies are slightly behind. The delay between a write on the primary and its
+    appearance on a replica is called **replication lag**. It is usually milliseconds, sometimes
+    seconds. Tomorrow's lesson is about what that breaks.
+
+    Second, databases can only hold so many open **connections** (conversations with app servers)
+    at once. If you have hundreds of app servers each holding many connections, the database spends
+    its memory on connections instead of answering queries. A **connection pooler** sits in between
+    and lets many app servers share a small number of real database connections.
+  deeper: |
+    ### Capacity arithmetic
+    Reads spread across primary plus replicas; writes only hit the primary. In the simulator
+    (medium PostgreSQL ~1,500 indexed qps per node, a write costs 1.5 units):
+
+    ```
+    workload: 5,000 reads/s, 200 writes/s
+    primary:  200 writes x 1.5 = 300 units -> 1,200 left for reads
+    replicas: 1,500 reads each
+    capacity: 1,200 + 3 x 1,500 = 5,700  -> primary + 3 replicas runs ~88% busy
+              primary + 4 replicas       -> ~70% busy, room for a spike
+    ```
+    The simulator treats replay on replicas as free. Real replicas apply the entire write stream
+    (and PostgreSQL replays it largely single-threaded), so replicas scale reads linearly only while
+    writes are a small fraction. At a high write share every node is busy replaying, and replicas
+    stop helping. That is the signal to scale writes instead (next lesson).
+
+    ### Connection limits
+    PostgreSQL forks a process per connection (several MB of memory each) and degrades with
+    hundreds of active backends; `max_connections` defaults to 100 and is rarely set much above a
+    few hundred. Active connections beyond ~2 to 4 × CPU cores mostly add contention.
+
+    ```
+    80 app instances x pool of 20 = 1,600 connections   <- too many
+    PgBouncer (transaction mode)  -> 50 server connections per node
+    ```
+    Transaction-mode pooling breaks session features (session-level prepared statements, advisory
+    locks, `SET` without `LOCAL`), so check your driver and ORM.
+
+    ### Routing reads
+    - **Application-level**: two connection pools, `writer` and `reader`. Explicit and simple.
+    - **Proxy-level**: ProxySQL, pgpool, RDS Proxy, Aurora reader endpoints. Transparent, but a
+      proxy cannot know which reads need fresh data.
+    - Reads inside a transaction that also writes must go to the primary.
+    - Read-after-write flows (show the profile the user just edited) need a primary read or a lag
+      check (Day 8).
+
+    ### Failure modes
+    - **Lag spikes** under write bursts, long-running queries on the replica blocking replay
+      (`hot_standby_feedback`, `max_standby_streaming_delay` trade replica query cancellation against
+      primary bloat), or a replica on a smaller instance than the primary.
+    - **Uneven load**: one replica gets slow, the LB keeps sending it traffic; use
+      least-connections and eject lagging replicas past a threshold.
+    - **Replicas as false HA**: a replica only helps availability if failover is configured to
+      promote it (Day 11).
+
+    ### When not to add replicas
+    If a cache would absorb the reads (high reuse), it is usually cheaper: a Redis node handles
+    ~80k ops/s versus ~1,500 for a medium database in the simulator. Replicas suit reads with low
+    reuse or complex queries a cache cannot answer, such as search filters and reports.
+  key_points:
+    - "Writes go to the primary; reads can be spread across replicas that replay the primary's changes."
+    - "Every replica replays every write, so replicas stop helping when writes dominate."
+    - "Replicas are slightly behind; read-after-write flows need a primary read or a lag check."
+    - "Database connections are expensive; use a pooler such as PgBouncer when app instances multiply."
+    - "For high-reuse reads, a cache is usually cheaper than more replicas."
+  concepts: [read-replicas, read-write-split, connection-pooling, database-replication]
+
+- slug: scaling-writes
+  day: 7
+  title: Scaling writes
+  minutes: 11
+  summary: Writes all land on one primary, so you scale them by making each write cheaper, batching them, smoothing bursts with a queue, and finally partitioning the data.
+  plain: |
+    Replicas helped readers, but every change still goes through one place: the primary. Think of
+    a single cashier who must record every sale in one ledger. Hiring more people to *look up*
+    sales does not help the cashier write faster.
+
+    Ways to help the cashier, from easiest to hardest:
+
+    1. **Make each write cheaper.** Every **index** on a table must be updated on every write. A
+       table with eight indexes does eight extra bits of work per row. Remove the ones you do not
+       need.
+    2. **Batch.** Writing 100 rows in one go is far cheaper than 100 separate writes, the way
+       recording ten sales at once is faster than walking to the ledger ten times.
+    3. **Smooth the bursts with a queue.** If 10,000 writes arrive in one second and then nothing,
+       put them in a **queue** (a waiting line that stores work safely) and let a **worker**
+       (a background program) write them at a steady pace the database can handle. Users get a
+       quick "received" instead of waiting.
+    4. **Buy a bigger primary.** Simple and often right, up to a point.
+    5. **Split the data (sharding).** Give each of several databases its own slice of the data,
+       for example users A to M on one and N to Z on another. Each slice has its own primary, so
+       write capacity multiplies. This is called **sharding** or **partitioning**, and it is
+       powerful but complicated, so it comes last.
+
+    The pattern is the same as everywhere in this course: try the cheap fixes first, measure, and
+    only take on complexity when the numbers say you must.
+  deeper: |
+    ### Where write cost comes from
+    Each committed write pays: WAL append and `fsync` (group commit amortises it), heap page update,
+    one B-tree insert per index, and replication to every replica. On PostgreSQL an `UPDATE` writes
+    a new row version; if it touches an indexed column it also updates every index (no HOT update).
+    The simulator charges a write 1.5 units versus 1 for an indexed read.
+
+    ### Levers in order of cost
+    | Lever | Typical gain | Cost |
+    |---|---|---|
+    | Drop unused indexes, avoid updating indexed columns | 1.2 to 2x | audit `pg_stat_user_indexes` |
+    | Batch inserts (`INSERT ... VALUES (...), (...)`, `COPY`) | 5 to 50x on bulk loads | latency per item rises |
+    | Coalesce updates (counters in Redis, flush every second) | orders of magnitude for hot rows | loses up to one interval on crash |
+    | Async via queue + workers | removes bursts from the critical path | eventual consistency, idempotent consumers |
+    | Larger primary, faster disks | ~2x per size step | ceiling, price premium at the top |
+    | Shard by key | ~N x | cross-shard queries, rebalancing, operational load |
+
+    ### Queues as a shock absorber
+    ```
+    API --enqueue (2 ms ack)--> queue --> workers --> DB at a steady 1,000 writes/s
+    burst: 6,000 writes/s for 30 s   -> backlog grows 5,000/s -> 150,000 queued
+    after the burst, 500 writes/s arrive -> drains at 500/s net -> 300 s
+    ```
+    Drain time = backlog / (drain rate − arrival rate). If average arrival exceeds drain capacity,
+    the queue only delays the failure. In the simulator a partition accepts ~5k msg/s and backlogs
+    beyond ~2 M lose writes.
+
+    ### Hot rows
+    A single counter row (likes on a viral post) serialises all writers on one row lock regardless
+    of hardware. Fixes: shard the counter into N rows and sum on read, or increment in Redis and
+    persist periodically.
+
+    ### Sharding, briefly
+    Choose a shard key that spreads writes and keeps common queries on one shard (`user_id` for
+    per-user data). Avoid monotonically increasing keys with range partitioning: all inserts land on
+    the newest shard. Expect to lose cross-shard joins and transactions. Day 21 covers it properly.
+
+    ### What interviewers probe
+    Whether you exhaust single-node options before sharding, whether you know replicas do not help
+    writes, how you handle a write burst (queue plus idempotent workers), and what you give up when
+    a write becomes asynchronous: the user's "saved" no longer means "visible to everyone".
+  key_points:
+    - "Replicas do not add write capacity; every write lands on the primary and is replayed everywhere."
+    - "Cheapen writes first: fewer indexes, batching, coalescing hot counters."
+    - "A queue absorbs bursts; it only helps if average arrival rate stays below drain capacity."
+    - "Sharding multiplies write capacity at the cost of cross-shard queries, transactions and operational complexity."
+  concepts: [write-scaling, write-batching, write-amplification, sharding, hot-rows]

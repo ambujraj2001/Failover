@@ -1,0 +1,165 @@
+slug: reads-drowning-the-primary
+kind: lab
+title: Reads are drowning the primary
+difficulty: medium
+day: 7
+summary: A fitness app's personalised dashboards flood PostgreSQL with reads a cache cannot absorb. Even the biggest instance is not enough. Spread reads across replicas.
+topics: [read-replicas, database-scaling, read-write-split, capacity]
+company_tags: [Strava, Meta, Google]
+estimated_minutes: 25
+incident: "SEV-1 · 59% of requests failing on Fernway dashboards · PostgreSQL primary 240% busy · Redis hit ratio 97% but idle"
+
+brief_beginner: |
+  You run **Fernway**, a fitness app. When someone opens it, the dashboard shows *their* runs,
+  *their* heart-rate zones and *their* weekly goals. Every one of those numbers comes from a
+  database query that is different for each person.
+
+  At **9,000 requests per second**, almost all of them reads, the single database is asked for far
+  more work than it can do. Last month someone added a Redis cache, and it works well, but only for
+  the 10% of data that is shared (like the exercise library). The personal stats cannot be cached
+  usefully, so they all still land on the database. Even the biggest database you can buy would be
+  over capacity.
+
+  Think of a library with one librarian answering every question. You cannot hire a librarian who
+  thinks infinitely fast, but you can set up extra desks with copies of the catalogue so others can
+  answer *questions*. Only the head librarian is allowed to *change* the books, though. Those copies
+  are **read replicas**.
+
+  **Your job:** spread the read traffic over several copies of the database so no single machine is
+  overwhelmed, and remember that every change still has to go through one place.
+
+brief_expert: |
+  9k rps, 95% reads, but only 10% of reads are cacheable (per-user aggregates); Redis hits ~97% of
+  those and is irrelevant to the bottleneck. ~7.7k indexed point reads/s plus ~450 writes/s (1.5 units
+  each) land on one primary: ~8.4k units/s. Large (3.5k) is at 240%; xlarge (8k) is the vertical
+  ceiling and still over.
+
+  Add read replicas: reads spread evenly over primary + replicas, writes stay on the primary. Price per
+  qps is the same whether you scale up or out, so the reason is the ceiling, not cost. Size the
+  primary for 100% of writes plus its share of reads. The write share will not stay at 5%.
+
+glossary:
+  - term: Primary
+    meaning: The main database server. Every write (insert, update, delete) must go to it.
+  - term: Read replica
+    meaning: A copy of the database that receives the primary's changes and can answer read queries, but not writes.
+  - term: Read/write split
+    meaning: Sending reads to replicas and writes to the primary, so reads can scale by adding copies.
+  - term: Vertical ceiling
+    meaning: The point where you cannot buy a bigger single machine. After that you must scale out.
+
+requirements:
+  - p99 latency under 80 ms at 9,000 req/s
+  - Error rate under 0.5%
+  - Stay within $4.40/hr
+
+budget: 4.40
+palette: [load_balancer, app_server, cache, database]
+
+starter:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 120}}
+    - {id: lb, type: load_balancer, label: Load Balancer, position: {x: 240, y: 120}}
+    - {id: api, type: app_server, label: Fernway API, config: {size: xlarge, instances: 7}, position: {x: 480, y: 120}}
+    - {id: redis, type: cache, label: Redis, config: {memory_gb: "4", ttl_s: 300}, position: {x: 720, y: 40}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: large, indexes: "id, user_id"}, position: {x: 720, y: 200}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: redis}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 120}}
+    - {id: lb, type: load_balancer, label: Load Balancer, position: {x: 240, y: 120}}
+    - {id: api, type: app_server, label: Fernway API, config: {size: xlarge, instances: 7}, position: {x: 480, y: 120}}
+    - {id: redis, type: cache, label: Redis, config: {memory_gb: "4", ttl_s: 300}, position: {x: 720, y: 40}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: xlarge, replicas: 1, indexes: "id, user_id"}, position: {x: 720, y: 200}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: redis}
+    - {source: api, target: db}
+
+tests:
+  - id: morning
+    name: Morning dashboard check
+    summary: 9,000 req/s, 95% reads, 90% of them personalised
+    scenario: {base_rps: 9000, read_ratio: 0.95, cacheable: 0.1, working_set_gb: 2, query_column: user_id}
+    assertions:
+      - {metric: p99_ms, op: lte, value: 80}
+      - {metric: error_rate, op: lte, value: 0.5}
+  - id: workout-sync
+    name: Evening workout sync
+    summary: Watches upload workouts, writes rise from 5% to 12% of traffic
+    hidden: true
+    scenario: {base_rps: 9000, read_ratio: 0.88, cacheable: 0.1, working_set_gb: 2, query_column: user_id}
+    assertions:
+      - {metric: p99_ms, op: lte, value: 90}
+      - {metric: error_rate, op: lte, value: 0.5}
+  - id: new-year
+    name: New Year's resolutions
+    summary: Traffic rises 20% for 20 seconds
+    hidden: true
+    scenario:
+      base_rps: 9000
+      read_ratio: 0.95
+      cacheable: 0.1
+      working_set_gb: 2
+      query_column: user_id
+      spikes: [{at: 20, duration: 20, multiplier: 1.2, ramp: 4}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 110}
+      - {metric: error_rate, op: lte, value: 0.5}
+
+hints:
+  - Run the test and compare Redis with PostgreSQL. Redis has a great hit ratio, so why is the database still drowning? Look at how much of the read traffic is cacheable.
+  - Try the biggest database size first and read its utilisation. When one machine is not enough even at its largest, what else does the database node offer for read-heavy load?
+  - Add read replicas. Reads are shared evenly between the primary and every replica, but every write still lands on the primary. An xlarge primary with one replica (or a large primary with several) works for today; then ask what happens to the primary when the share of writes doubles.
+
+editorial: |
+  ### Why it broke
+  Only **10%** of reads are cacheable (the shared exercise library). Redis hits ~97% of those, but
+  that saves the database barely 830 queries/s. The other **~7,700 personalised reads/s**, plus
+  **~450 writes/s** at 1.5 units each, all land on one PostgreSQL node: about **8,400 units/s**.
+
+  * `large` (3,500 qps): **240%** busy. 59% of requests fail; the survivors see p99 ≈ 2.9 s.
+  * `xlarge` (8,000 qps): still **105%**. About 4% of requests fail and p99 sits near 800 ms.
+
+  There is no bigger box. This is the vertical ceiling.
+
+  ### The fix: read replicas
+  ```
+  API ──reads──→ primary + replica   (split evenly)
+      └─writes─→ primary only
+  ```
+  With an `xlarge` primary and **one replica**, each node takes ~3,860 reads/s; the primary also takes
+  all writes (~675 units), so it runs at ~**57%** and the replica at ~48%. p99 drops to about
+  **70 ms** with no errors, for **$4.01/hr**.
+
+  Note that replicas are *not* cheaper per query in this catalogue: large + 3 replicas costs the same
+  as xlarge + 1. You add them because a single node cannot go further, and because each copy is
+  also a warm standby.
+
+  ### The trap: replicas do not help writes
+  The hidden test raises writes from 5% to 12% of traffic (watches syncing workouts). A design built
+  from a `large` primary and three replicas passes today, but its primary now carries
+  ~1,620 write units **plus** a quarter of all reads: about 97% busy, and p99 jumps past 400 ms.
+  Adding a fourth replica only trims the read share (p99 still ≈ 115 ms). The xlarge primary stays
+  near 65%. Size the primary for *all* writes plus its share of reads.
+
+  Replication also has a consistency cost: asynchronous replicas lag slightly, so a few reads return
+  slightly old data (~0.45% here). Tomorrow's lab is about exactly that.
+
+  ### Alternatives
+  * **Cache the personalised data** per user with short TTLs. This helps if the same user reloads often,
+    but the working set is every active user and the data changes after each workout.
+  * **Precompute dashboards** (materialised views or a summary table updated on write) to turn
+    several reads into one.
+  * **Sharding** by `user_id` scales writes as well as reads, at much higher complexity. Reach for it
+    when the primary's *write* load hits the ceiling.
+
+  ### Interview takeaway
+  Read-heavy and uncacheable means read replicas: reads scale with the number of copies, writes do not.
+  Always state the primary's load as writes + reads ÷ (replicas + 1), and mention replication lag.

@@ -1,0 +1,172 @@
+- slug: redundancy-and-failover
+  day: 11
+  title: Redundancy and failover
+  minutes: 10
+  summary: Remove single points of failure by keeping spares, and decide in advance how quickly you switch to them (RTO) and how much data you can lose (RPO).
+  plain: |
+    A hospital keeps a backup generator. When the mains power fails, the generator starts within
+    seconds and the operating theatres keep running. Nobody waits for the power company. That is
+    **redundancy**: having a spare ready for anything whose failure would stop the whole system.
+
+    A component whose failure takes everything down is a **single point of failure** (SPOF). In a
+    simple web system the usual suspects are: one database, one load balancer, one cache, one data
+    centre. The first job of reliability work is to list them.
+
+    Switching to the spare is called **failover**. For a database, it usually looks like this: a
+    **replica** (a copy kept up to date) is watching the **primary**. When the primary stops
+    responding, the replica is **promoted**: it becomes the new primary, and the app is pointed at
+    it. Users see a short blip instead of an outage that lasts until someone wakes up.
+
+    Two numbers describe a failover plan:
+
+    - **RTO, recovery time objective**: how long you may be down. "We are back within 30 seconds."
+    - **RPO, recovery point objective**: how much recent data you may lose, measured in time. "We
+      may lose at most the last 1 second of writes." If the replica was a second behind when the
+      primary died, that last second is gone.
+
+    There are two common setups:
+
+    - **Active-passive**: the spare sits idle until needed, like the generator.
+    - **Active-active**: all copies serve traffic all the time, and the survivors absorb the load
+      when one fails.
+
+    Spares only help if failover actually works, so good teams practise it regularly.
+  deeper: |
+    ### Anatomy of a database failover
+    ```
+    t=0      primary dies
+    t=0-10s  detection: N missed health checks (too fast = false failovers)
+    t+1-5s   election / promotion of the most up-to-date replica
+    t+0-30s  clients reconnect: DNS TTL, proxy update, connection pool refresh
+    ```
+    Managed services quote ~30 to 120 s (RDS Multi-AZ typically 60 to 120 s; Aurora often under 30 s).
+    In the simulator, `failover` with at least one replica turns a primary death into a ~12 s outage;
+    without it, the outage is permanent. Load balancer health checks stop routing to dead app
+    instances after ~3 s.
+
+    ### RPO depends on the replication mode
+    | Replication | RPO | RTO driver |
+    |---|---|---|
+    | Async replica | seconds of lag at failure time | detection + promotion |
+    | Sync / quorum replica | ~0 | same, plus higher write latency every day |
+    | Nightly backup + WAL archive | minutes (since last archived segment) | restore time: hours for TB |
+    | Cross-region async | seconds to minutes | DNS and traffic shift, often manual |
+
+    ### Split brain and fencing
+    If the old primary was only partitioned, not dead, two nodes may accept writes and diverge. Use a
+    consensus-based coordinator (Patroni with etcd, Orchestrator, cloud control planes), require a
+    quorum to promote, and **fence** the old primary: revoke its storage, kill it via the cloud API
+    (STONITH), or reject writes carrying an old epoch/term.
+
+    ### Capacity is part of redundancy
+    N+1 means you can lose one unit and still carry peak. Three app instances at 70% each cannot
+    lose one (the survivors would need 105%). Across availability zones, size each zone set so that
+    losing a whole zone keeps the rest under ~80%. Active-active across two sites means each normally
+    runs below 50%.
+
+    ### Failure modes
+    - **Correlated failures**: replicas in the same rack or zone, the same bad deploy rolled to all,
+      a shared dependency (DNS, auth, config service).
+    - **Failover that was never tested**: expired credentials on the standby, a replica that fell
+      days behind, clients that cache the old IP forever.
+    - **Flapping**: aggressive detection plus a transient network blip causes repeated failovers,
+      each with its own RPO loss.
+    - **Retry storms on recovery**: every client reconnects at once to the new primary.
+
+    Interviewers ask "what if X dies?" for every box. Answer with detection time, promotion
+    mechanism, RTO and RPO numbers, and what the user sees during the gap.
+  key_points:
+    - "List every single point of failure: database, load balancer, cache, zone, region."
+    - "RTO is how long you may be down; RPO is how much recent data you may lose."
+    - "Async replicas give seconds of RPO; synchronous replicas give near-zero RPO at a write latency cost."
+    - "Prevent split brain with quorum-based promotion and fencing of the old primary."
+    - "Redundancy needs spare capacity (N+1) and regular failover drills, or it is theoretical."
+  concepts: [single-point-of-failure, failover, rto-and-rpo, active-passive-vs-active-active, split-brain]
+
+- slug: slos-and-error-budgets
+  day: 11
+  title: SLOs and error budgets
+  minutes: 9
+  summary: An SLO sets a measurable reliability target, and the error budget it implies tells you when to ship faster and when to stop and fix things.
+  plain: |
+    A bus company cannot promise every bus is on time; traffic happens. Instead it promises
+    something measurable: "99% of buses arrive within 3 minutes of schedule." It measures this every
+    month. If it hits 99.5%, it can try a new, riskier route. If it drops to 98%, it stops
+    experimenting and fixes the problem routes.
+
+    Software reliability works the same way, with three terms that sound alike:
+
+    - **SLI, service level indicator**: the thing you measure. "The share of requests that succeed
+      in under 300 ms."
+    - **SLO, service level objective**: the target for that measurement over a time window. "99.9%
+      of requests over 30 days."
+    - **SLA, service level agreement**: a contract with customers that says what happens, usually
+      refunds, if you miss a promised level. SLAs are set looser than SLOs so you notice problems
+      before they cost money.
+
+    The clever part is the **error budget**. If the target is 99.9%, then 0.1% of requests are
+    *allowed* to fail. Over a month that is about 43 minutes of full downtime, or a much longer
+    period of partial errors. That allowance is a budget you can spend.
+
+    When there is plenty left, the team can deploy often and try risky changes. When the budget is
+    nearly used up, the team slows down, freezes risky launches and works on reliability. This turns
+    the old argument between "ship features" and "keep it stable" into a number both sides agreed on.
+
+    Note that 100% is the wrong target. It is impossible, and chasing it stops all change.
+  deeper: |
+    ### Good SLIs
+    Measure what users experience, as close to them as possible (load balancer or client), as a
+    ratio of good events to valid events:
+
+    ```
+    availability SLI = good requests / valid requests        (exclude 4xx caused by clients)
+    latency SLI      = requests faster than 300 ms / valid requests
+    freshness SLI    = reads with data younger than 60 s / reads
+    ```
+    Prefer "share of requests under a threshold" over "p99 latency" for SLOs: it composes over time
+    windows and turns directly into a budget.
+
+    ### Budget arithmetic
+    | SLO (30 days) | Budget | At 1,000 rps |
+    |---|---|---|
+    | 99% | 7.2 h | 25.9 M failed requests |
+    | 99.9% | 43.2 min | 2.6 M |
+    | 99.95% | 21.6 min | 1.3 M |
+    | 99.99% | 4.3 min | 259 k |
+
+    ### Burn-rate alerting
+    Burn rate = observed error rate / budgeted error rate. A burn rate of 1 spends the budget exactly
+    over the window. Alert on fast and slow burns over two windows each to cut noise (from the Google
+    SRE workbook):
+
+    | Severity | Burn rate | Long / short window | Budget consumed |
+    |---|---|---|---|
+    | Page | 14.4 | 1 h / 5 min | 2% |
+    | Page | 6 | 6 h / 30 min | 5% |
+    | Ticket | 1 | 3 days / 6 h | 10% |
+
+    This beats "error rate > 1% for 5 minutes", which pages on blips at low traffic and misses slow
+    leaks.
+
+    ### Policy matters more than math
+    An error budget only works with an agreed policy: what happens when it is exhausted (feature
+    freeze, reliability work prioritised, postmortems required), who can override, and how planned
+    maintenance counts.
+
+    ### Failure modes
+    - SLOs on internal metrics (CPU, DB latency) rather than user-visible outcomes.
+    - Too many SLOs: nobody knows which matters. Start with one availability and one latency SLO per
+      critical user journey.
+    - Targets above what dependencies provide: a 99.99% SLO on top of a 99.9% database is fiction
+      unless you design around it.
+    - Averaging across endpoints, letting a high-volume healthy endpoint hide a broken checkout.
+
+    Interviewers expect you to propose concrete SLIs and SLOs for the system you designed, convert
+    them to budgets, and explain how they drive alerting and release decisions.
+  key_points:
+    - "SLI is what you measure, SLO is the target, SLA is the contract with consequences, set looser than the SLO."
+    - "Error budget = 1 - SLO: 99.9% over 30 days allows 43.2 minutes of full downtime."
+    - "Define SLIs as good events over valid events, measured as close to the user as possible."
+    - "Alert on budget burn rate over paired windows instead of raw error thresholds."
+    - "The budget needs an agreed policy: when it runs out, reliability work takes priority over features."
+  concepts: [sli-slo-sla, error-budgets, burn-rate-alerting]

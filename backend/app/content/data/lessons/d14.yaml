@@ -1,0 +1,173 @@
+- slug: real-time-connections
+  day: 14
+  title: Real-time connections
+  minutes: 11
+  summary: Chat needs the server to push messages the instant they arrive, which means long-lived connections (usually WebSockets), a gateway tier that holds them, and a way to find which gateway a user is on.
+  plain: |
+    Normal web requests work like letters: the browser asks, the server answers, and the
+    conversation is over. That is a problem for chat. When your friend sends a message, the server
+    has it, but it cannot send it to you until you ask.
+
+    There are a few ways around this:
+
+    - **Polling**: ask "anything new?" every few seconds. Simple, but wasteful: most answers are
+      "no", and messages arrive up to a few seconds late. Like checking your letterbox every five
+      minutes.
+    - **Long polling**: ask "anything new?" and the server holds the question open until there *is*
+      something, or until about 30 seconds pass. Better, but each message still needs a new request.
+    - **Server-Sent Events (SSE)**: the browser opens one connection and the server keeps sending
+      updates down it. One direction only: server to browser. Good for live scores or notifications.
+    - **WebSockets**: one connection that stays open, and *both* sides can send at any time. Like a
+      phone call that never hangs up. This is what most chat apps use.
+
+    Keeping millions of phone calls open needs its own machines. These **gateway** servers (also
+    called connection servers) do little except hold connections and pass messages along.
+
+    That raises a new question. You are connected to gateway 17; your friend is on gateway 4. When
+    your friend sends a message, how does the system know to deliver it through gateway 17? It keeps
+    a **connection registry**: a fast lookup table saying which user is connected to which gateway.
+
+    The same information powers **presence**, the green dot that shows who is online. Clients send a
+    small **heartbeat** every so often; if the heartbeats stop, the user is shown as offline.
+  deeper: |
+    ### Options compared
+    | | Polling | Long polling | SSE | WebSocket |
+    |---|---|---|---|---|
+    | Direction | client pull | client pull | server push | bidirectional |
+    | Latency | up to interval | ~1 RTT | ~1 RTT | ~1 RTT |
+    | Overhead per message | full request | full request | small frame | 2 to 14 byte frame |
+    | Proxies, firewalls | trivial | trivial | plain HTTP, easy | needs upgrade support |
+    | Fit | dashboards | fallback | feeds, notifications | chat, games, collaboration |
+
+    ### Architecture
+    ```
+    client ==WS==> L4 LB ==> gateway-17 --(register user->gw17 in Redis, TTL 60 s)
+    send:  gateway-4 -> chat service -> persist (message store) -> lookup recipients
+           -> publish to gw17 (direct RPC or pub/sub channel per gateway) -> push over WS
+    offline recipient -> push notification service (APNs/FCM)
+    ```
+    Keep gateways thin and stateless apart from the sockets themselves: authentication at connect,
+    then forwarding. Business logic lives in services that can be deployed without dropping
+    connections.
+
+    ### Numbers
+    An idle WebSocket costs roughly 10 to 50 KB of memory (kernel buffers plus user-space state),
+    and a tuned server holds hundreds of thousands to over a million connections. Budget around
+    100k to 500k per gateway for headroom. For 50 M concurrent users at 250k each, that is 200
+    gateways before redundancy. Heartbeats every 30 s across 50 M connections are ~1.7 M small
+    messages per second on their own, so their interval is a real cost lever.
+
+    ### Failure modes
+    - **Reconnect storms**: a gateway deploy or crash drops 250k clients who reconnect at once. Use
+      jittered exponential backoff on clients, drain gateways gradually during deploys (stop
+      accepting, ask clients to reconnect over minutes), and rate-limit connection setup.
+    - **Stale registry entries**: a gateway dies without cleaning up. TTLs refreshed by heartbeats
+      handle it; delivery to a dead gateway falls back to the offline path.
+    - **Load balancer timeouts**: idle timeouts (often 60 s) silently kill quiet sockets. Heartbeat
+      under the shortest idle timeout on the path.
+    - **Uneven load**: long-lived connections do not rebalance when you add gateways; new capacity
+      only fills as clients reconnect.
+
+    ### What interviewers probe
+    Why WebSockets over polling (with numbers), how a message finds the recipient's gateway, what
+    happens when a gateway dies, and how presence is computed without broadcasting every status
+    change to every contact (fan out presence only to users currently viewing that contact, or
+    batch updates).
+  key_points:
+    - "Polling wastes requests and adds delay; long polling, SSE and WebSockets let the server push."
+    - "WebSockets give a persistent bidirectional channel with tiny per-message overhead, the default for chat."
+    - "Gateway servers hold connections; a registry maps each user to their gateway so messages can be routed."
+    - "Presence comes from heartbeats with TTLs; heartbeat volume at scale is a real cost."
+    - "Plan for reconnect storms: jittered client backoff and gradual gateway draining."
+  concepts: [websockets, long-polling, server-sent-events, connection-gateway, presence]
+
+- slug: message-ordering-and-delivery
+  day: 14
+  title: Message ordering and delivery
+  minutes: 11
+  summary: Chat must show messages in the right order exactly once, even with retries and offline phones, which takes per-conversation sequence numbers, client-generated IDs and an inbox for offline users.
+  plain: |
+    Three things must feel right in a chat app: messages appear **in order**, each appears **once**,
+    and none goes **missing**, even if your phone was in a tunnel when they were sent.
+
+    **Ordering.** You cannot trust clocks for this. Your phone's clock and your friend's can differ
+    by seconds. Instead, the server gives each message in a conversation a **sequence number**: 1, 2,
+    3, and so on, like numbered tickets at a deli counter. Phones display messages sorted by that
+    number. If a phone has 41 and then receives 43, it knows 42 is missing and asks for it.
+
+    **Exactly once, as far as the user can tell.** Networks drop connections. Your phone sends a
+    message, the connection breaks before the server's reply arrives, and the phone sends it again.
+    Now the server may have it twice. The fix: the phone gives every message its own unique ID
+    before sending. If the server sees the same ID again, it ignores the duplicate. Removing repeats
+    like this is called **deduplication**.
+
+    **Delivery receipts.** The ticks in messaging apps mean different stages:
+
+    - **Sent**: the server has safely stored the message.
+    - **Delivered**: the recipient's phone has received it.
+    - **Read**: the recipient opened the conversation.
+
+    Each stage is a small message flowing back to the sender.
+
+    **Offline users.** If your friend's phone is off, the server keeps the message in their
+    **inbox** (a list of messages waiting for them) and sends a **push notification** through Apple's
+    or Google's service. When the phone reconnects, it asks "give me everything after sequence number
+    41" and catches up.
+
+    None of this needs perfect networks. It needs numbering, unique IDs, and a place to wait.
+  deeper: |
+    ### Sequencing per conversation
+    Global ordering is unnecessary and expensive; users only perceive order within a conversation.
+    Assign `seq` at the server on write, serialised per conversation:
+
+    ```sql
+    -- one row per conversation holds the counter
+    UPDATE conversations SET last_seq = last_seq + 1 WHERE id = $1 RETURNING last_seq;
+    INSERT INTO messages (conversation_id, seq, client_msg_id, sender_id, body, created_at)
+    VALUES ($1, $2, $3, $4, $5, now())
+    ON CONFLICT (conversation_id, client_msg_id) DO NOTHING;
+    ```
+    The per-conversation counter is a hot row for very busy groups; alternatives are routing each
+    conversation to one owner (a partition or actor) that assigns sequence numbers in memory, or
+    Snowflake-style IDs (time + machine + counter) where approximate order is acceptable.
+
+    ### Storage shape
+    Wide-column stores fit naturally: partition key `conversation_id`, clustering key `seq` (or a
+    time-ordered message ID), so "latest 50" and "everything after seq 41" are single-partition range
+    reads. Very large groups need bucketing (`conversation_id, month`) to bound partition size.
+
+    ### Delivery pipeline
+    ```
+    client --send(client_msg_id)--> server: persist, assign seq, ack "sent"(seq)
+    server -> recipient gateway -> recipient device: deliver(seq)
+    recipient device --ack(seq)--> server -> sender: "delivered"
+    recipient opens chat --read(up_to_seq)--> server -> sender: "read"
+    ```
+    Delivery is at-least-once end to end; idempotency comes from `client_msg_id` on the write path
+    and `seq` on the read path (devices discard seqs they already have). Read receipts should carry
+    "read up to seq N" rather than per-message events, which collapses thousands of acks into one.
+
+    ### Offline and multi-device
+    Track a per-device cursor (`last_acked_seq` per conversation, or a global per-user inbox
+    offset). On reconnect, the device syncs everything past its cursor, paginated. Push
+    notifications are best-effort hints, not the delivery mechanism: APNs/FCM may coalesce or drop
+    them.
+
+    ### Failure modes
+    - Ordering by client timestamp: skewed clocks reorder messages.
+    - Ack lost after persist: the client retries and creates a duplicate without `client_msg_id`.
+    - Group fan-out at 1,000+ members amplifies every message; deliver to online members via gateways,
+      and let offline members pull from the conversation log instead of writing into each inbox.
+    - Sequence gaps from aborted transactions or deduplicated retries (the counter above still
+      advanced): clients must request missing seqs but tolerate holes
+      that never fill.
+
+    Interviewers probe for per-conversation ordering, idempotent sends, receipts as cursors, the
+    offline sync protocol, and how group size changes the fan-out design.
+  key_points:
+    - "Order messages by server-assigned per-conversation sequence numbers, never by device clocks."
+    - "Client-generated message IDs make retries idempotent; sequence numbers let devices detect gaps and discard repeats."
+    - "Receipts (sent, delivered, read) are acknowledgements; send read receipts as read-up-to-seq cursors."
+    - "Offline devices sync from a stored cursor on reconnect; push notifications are only hints."
+    - "Partition message storage by conversation and cluster by sequence for cheap range reads."
+  concepts: [message-ordering, sequence-numbers, message-deduplication, delivery-receipts, offline-sync]

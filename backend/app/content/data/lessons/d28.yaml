@@ -1,0 +1,62 @@
+- slug: common-mistakes
+  day: 28
+  title: Common system design interview mistakes
+  minutes: 10
+  summary: "The mistakes that sink most system design interviews, why each one costs points, and the specific habit that prevents it."
+  plain: |
+    Most failed system design interviews fail for a handful of repeat reasons, and almost none of them are about not knowing a technology. They are about process: what you do first, what you skip, and how you talk.
+
+    Think of a driving test. Examiners rarely fail people for not knowing how an engine works. They fail them for not checking mirrors, rolling through a stop sign, or panicking when a cyclist appears. Small, visible habits decide the outcome.
+
+    The most common mistakes:
+    - **Designing before understanding**: drawing boxes in the first minute, before asking who the users are, what they do, and how many there are.
+    - **No numbers**: never estimating traffic or storage, so choices like "we need sharding" have nothing behind them.
+    - **Buzzword stacking**: adding Kafka, Kubernetes, microservices and three databases because they sound impressive, not because the problem needs them.
+    - **Running out of time**: spending twenty minutes on the API and never reaching the hard part.
+    - **Silence**: thinking quietly for long stretches, so the interviewer cannot follow or help.
+    - **Ignoring failure**: a design that works only when nothing breaks.
+    - **Arguing with hints**: defending a choice after the interviewer has pointed out a problem with it.
+    - **Single points of failure**: one database, one load balancer, one region, with no backup plan mentioned.
+
+    Today's simulator task adds a twist halfway through, the way a real interviewer changes the requirements. The skill being tested is adapting calmly: restate the new requirement, find what it breaks in your design, and fix that part without starting over.
+  deeper: |
+    ### Mistake, why it costs, the fix
+    | Mistake | Why it costs | Habit that prevents it |
+    |---|---|---|
+    | Boxes before requirements | you solve the wrong problem; no problem-navigation signal | first 5 minutes: functional, non-functional, scale, out of scope |
+    | No estimation | every scaling decision looks arbitrary | 3 numbers minimum: peak QPS, read:write, storage/yr |
+    | Over-engineering | signals poor judgement; leaves no time for depth | start with the simplest design that meets the numbers, then scale the bottleneck |
+    | Under-engineering at senior levels | a single Postgres for 1M writes/s ignores your own numbers | let the estimate force the design |
+    | Never reaching depth | no technical-depth signal at all | deep dive by minute 20, chosen where it is hard |
+    | Vague components ("a service handles it") | interviewer cannot score the unspecified | for each box: what it stores, its key, its access pattern |
+    | Wrong datastore reasoning | "NoSQL because scale" is a red flag | choose from access patterns, consistency needs and write rate |
+    | Cache with no invalidation story | stale data bugs, stampedes | state TTL, invalidation on write, stampede protection |
+    | Ignoring the twist | shows rigidity | restate, diff your design, change only what breaks |
+    | No failure discussion | one-dimensional design | wrap-up: each stateful component dies — what happens? |
+
+    ### Level-specific traps
+    - **E4**: freezing on an unfamiliar problem. Reduce it to a familiar one ("this is a feed with a different ranking") and say so.
+    - **E5**: going broad instead of deep. Five components at shallow depth scores lower than two at real depth.
+    - **E6**: staying at whiteboard level. Staff interviewers expect migration paths, operability, cost and what you would deliberately not build.
+
+    ### The twist, handled well
+    Interviewer, at minute 25: "Now users must see their own edits immediately, even across devices."
+    1. Restate: "So read-your-writes across sessions, not just within one."
+    2. Diff: "My async replicas break this — a read after a write can hit a lagging replica."
+    3. Options: route a user's reads to the primary for N seconds after a write; or carry a write version token and read only from replicas caught up to it.
+    4. Decide and cost it: "Version token: no extra primary load, small client change."
+    5. Continue.
+
+    Thirty seconds, no redraw, clear signal.
+
+    ### Red-flag phrases
+    "It's eventually consistent so it's fine" (fine for what?), "we'll just add more servers" (which tier, how many, what is the bottleneck?), "Kafka guarantees exactly-once" (only within Kafka), "Redis is the database" (persistence and durability story?). Each invites a follow-up you may not enjoy.
+
+    ### Practice protocol
+    Record yourself on a timed problem, then score it against the table above. Most people find two habitual mistakes; fixing those is worth more than learning another technology.
+  key_points:
+    - "Most failures are process failures: designing before requirements, no numbers, no depth, silence and no failure discussion."
+    - "Let your own estimates force the design, so you neither over-engineer nor under-engineer."
+    - "For every box, state what it stores, its key and its access pattern; vague components cannot be scored."
+    - "Handle a mid-interview twist by restating it, finding exactly what it breaks, and changing only that."
+  concepts: [interview-mistakes, over-engineering, single-point-of-failure, read-your-writes]

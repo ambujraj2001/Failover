@@ -1,0 +1,153 @@
+slug: static-files-choking-the-api
+kind: lab
+title: Static files are choking the API
+difficulty: easy
+day: 2
+summary: A wallpaper gallery's API spends most of its time serving images and JavaScript. Move static files to a CDN.
+topics: [cdn, static-content, edge-caching, load-balancing]
+company_tags: [Pinterest, Cloudflare]
+estimated_minutes: 15
+incident: "SEV-2 · 88% of requests failing on Wallgrove · API CPU 141% · 92% of traffic is /static"
+
+brief_beginner: |
+  You run **Wallgrove**, a site where people browse and download phone wallpapers. Every page is
+  mostly pictures: a single visit loads one small piece of data (the list of wallpapers) and a dozen
+  images, icons and script files.
+
+  Right now **every** one of those requests goes to your own API servers. Out of **9,000 requests
+  per second**, about **92%** are for those files, which never change and are the same for every
+  visitor. Your four servers spend most of their effort handing out the same pictures over and over,
+  and the real work (search, favourites, uploads) is stuck in the queue behind them. Most visitors
+  get an error.
+
+  Imagine a restaurant where the chef also walks out to pour every glass of water. You would not hire
+  more chefs. You would put a water jug by the door so guests help themselves, and let the chef cook.
+  A **CDN** is that jug: copies of your files sitting in data centres close to your users.
+
+  **Your job:** get the images and scripts off your servers so they only handle the requests that
+  actually need them, without blowing the budget on extra servers.
+
+brief_expert: |
+  9k rps, 92% static (images, JS bundles, CSS; immutable, versioned URLs), 8% dynamic (85% reads).
+  Static costs 0.25 units on the app tier, dynamic ~1.05, so static is ~70% of the ~2.8k units
+  landing on 4 × medium (2k units). The tier is saturated, threads are exhausted, and dynamic traffic
+  is collateral damage. PostgreSQL is ~50% busy and is not the issue.
+
+  Offload static to an edge CDN (Users → CDN → LB, ~95% edge hit ratio, origin sees the misses). The
+  CDN has a per-request cost, so compare it with scaling the app tier to ~7–8 instances; the budget
+  only fits one of those.
+
+glossary:
+  - term: Static file
+    meaning: A file that is the same for every user and rarely changes, such as an image, a font or a JavaScript bundle.
+  - term: CDN
+    meaning: Content delivery network. Servers spread around the world that keep copies of your static files and serve them close to users.
+  - term: Edge
+    meaning: The CDN location nearest to a user. Serving from the edge means the request never reaches your own servers.
+  - term: Origin
+    meaning: Your own servers, where the CDN fetches a file the first time (or when its copy expires).
+
+requirements:
+  - p99 latency under 40 ms at 9,000 req/s
+  - Error rate under 0.5%
+  - Stay within $0.88/hr (doubling the API fleet does not fit)
+
+budget: 0.88
+palette: [cdn, load_balancer, app_server, database]
+
+starter:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 120}}
+    - {id: lb, type: load_balancer, label: Load Balancer, position: {x: 240, y: 120}}
+    - {id: api, type: app_server, label: Wallgrove API, config: {size: medium, instances: 4}, position: {x: 480, y: 120}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: medium}, position: {x: 720, y: 120}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 120}}
+    - {id: cdn, type: cdn, label: CDN, position: {x: 240, y: 120}}
+    - {id: lb, type: load_balancer, label: Load Balancer, position: {x: 480, y: 120}}
+    - {id: api, type: app_server, label: Wallgrove API, config: {size: medium, instances: 4}, position: {x: 720, y: 120}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: medium}, position: {x: 960, y: 120}}
+  edges:
+    - {source: users, target: cdn}
+    - {source: cdn, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: db}
+
+tests:
+  - id: normal
+    name: A normal evening
+    summary: 9,000 req/s, 92% images and scripts
+    scenario: {base_rps: 9000, read_ratio: 0.85, static_ratio: 0.92}
+    assertions:
+      - {metric: p99_ms, op: lte, value: 40}
+      - {metric: error_rate, op: lte, value: 0.5}
+  - id: new-collection
+    name: New collection drops
+    summary: Traffic rises 30% for 20 seconds
+    hidden: true
+    scenario:
+      base_rps: 9000
+      read_ratio: 0.85
+      static_ratio: 0.92
+      spikes: [{at: 20, duration: 20, multiplier: 1.3, ramp: 4}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 50}
+      - {metric: error_rate, op: lte, value: 0.5}
+  - id: instance-dies
+    name: An API instance crashes
+    summary: One API instance dies at t=25s
+    hidden: true
+    scenario:
+      base_rps: 9000
+      read_ratio: 0.85
+      static_ratio: 0.92
+      events: [{at: 25, type: kill_app_instance, count: 1}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 75}
+      - {metric: error_rate, op: lte, value: 0.3}
+
+hints:
+  - Run the test and open the API node. It is overloaded, but look at what kind of requests make up most of its traffic.
+  - Those images and scripts are identical for every visitor and never change. Is there a component that can answer them before they ever reach your load balancer?
+  - Add a CDN and route Users → CDN → Load Balancer (remove the direct Users → Load Balancer edge). The CDN answers about 95% of static requests at the edge and forwards everything else. Then check whether you still need every API instance.
+
+editorial: |
+  ### Why it broke
+  Of **9,000 req/s**, about **8,280** are static files and **720** are real API calls. Serving a file
+  is cheap (0.25 units) but there are so many of them that they add up to about **2,070 units/s**,
+  versus roughly **750** for the API calls. Four medium instances can do **2,000 units/s**, so the
+  tier runs at **141%**: requests queue, worker threads fill up, and **88% of requests fail**. The
+  database is only about half busy, so it is not the cause.
+
+  ### The fix: put a CDN in front
+  ```
+  Users → CDN ──(95% of static served at the edge, ~6 ms)
+           └──→ Load Balancer → API × 4 → PostgreSQL   (dynamic + 5% static misses)
+  ```
+  The API now sees about **750 units** of real work plus **~100 units** of static misses: roughly
+  **43%** busy. p99 falls to about **32 ms** with no errors, for **$0.80/hr**. Most of that new cost
+  is the CDN's per-request fee, which is still cheaper than the servers it replaces.
+
+  ### The trap: headroom you no longer think about
+  The hidden tests add a 30% traffic rise and kill an API instance mid-run. With the CDN in place both
+  are easy: even three instances would survive. Without it, every extra visitor lands on the API four
+  times over (one page, many files).
+
+  ### Why not just add servers?
+  You need about **7–8 medium instances** to carry the static traffic yourself, which costs around
+  $0.90–1.00/hr with the extra load balancer traffic, over budget, and the six that do fit run at 94% busy (p99 ≈ 180 ms).
+  More servers also do nothing for users far from your data centre, while a CDN serves them from a
+  nearby edge. Other options exist in real life (object storage behind the CDN as the origin, longer
+  `Cache-Control` headers with versioned file names), but the core move is the same: never let your
+  application servers hand out immutable bytes.
+
+  ### Interview takeaway
+  Split traffic by type before scaling anything. Static and media go to a CDN with long cache
+  lifetimes and versioned URLs; the app tier only handles dynamic requests. Count requests per page
+  view, not just page views.

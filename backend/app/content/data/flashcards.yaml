@@ -1,0 +1,616 @@
+# Spaced-repetition cards. concept: slug from concepts.yaml. day: curriculum day (1-30).
+
+# Day 1
+- id: nfr-drive-architecture
+  front: "Two systems have identical features. Why might their architectures look nothing alike?"
+  back: "Architecture is driven mostly by non-functional requirements: scale, latency, availability, consistency and cost. Ten users and ten million users with the same features need very different designs."
+  concept: non-functional-requirements
+  day: 1
+- id: why-percentiles-not-average
+  front: "Why report p99 latency instead of the average?"
+  back: "Averages hide the slow tail. A 20 ms average can coexist with 1% of requests taking 2 s, and heavy users, who make many requests, hit that tail constantly."
+  concept: p99-latency
+  day: 1
+- id: fan-out-tail
+  front: "A page calls 50 backends in parallel, each with a 1% chance of being slow. Roughly how often is the page slow?"
+  back: "1 - 0.99^50, about 40% of page loads. Fan-out turns a rare backend tail into a common user experience, which is why p99 per backend matters."
+  concept: tail-latency-amplification
+  day: 1
+- id: latency-rises-near-saturation
+  front: "Why does latency climb sharply as a server approaches 100% utilisation, even though throughput barely changes?"
+  back: "Queueing: as utilisation nears 1, arrivals increasingly wait behind other requests, and waiting time grows roughly as 1 / (1 - utilisation). Keep steady-state utilisation well below saturation."
+  concept: latency-vs-throughput
+  day: 1
+- id: serial-availability
+  front: "A request passes through three components in series, each 99.9% available. What is the end-to-end availability?"
+  back: "About 99.7% (0.999^3). Availabilities multiply in series, so every added dependency lowers the ceiling; redundancy in parallel raises it."
+  concept: availability-nines
+  day: 1
+- id: one-server-spof
+  front: "Why is one well-provisioned server still a reliability problem?"
+  back: "It is a single point of failure: a crash, deploy or hardware fault takes the whole service down, no matter how much spare CPU it had."
+  concept: single-point-of-failure
+  day: 1
+
+# Day 2
+- id: dns-ttl-tradeoff
+  front: "What is the trade-off when setting a DNS record's TTL?"
+  back: "Low TTLs let you shift traffic quickly during failover but increase lookup volume and latency; high TTLs cache well but keep clients pointed at a dead address longer."
+  concept: dns
+  day: 2
+- id: tls-at-edge
+  front: "Why terminate TLS at a CDN or edge load balancer near the user?"
+  back: "The handshake costs at least one round trip. Doing it a few milliseconds away instead of across an ocean removes most of that cost, and the edge can reuse warm connections to the origin."
+  concept: tls-handshake
+  day: 2
+- id: l7-needed
+  front: "When do you need an L7 load balancer rather than L4?"
+  back: "When routing depends on request content: path-based routing, header or cookie affinity, per-route rate limits or HTTP retries. L4 only sees addresses and ports."
+  concept: l4-vs-l7-load-balancing
+  day: 2
+- id: cdn-static-offload
+  front: "Your API servers spend most of their CPU serving images and JavaScript. What is the cheapest fix?"
+  back: "Put a CDN in front for static assets. It serves the large majority from edge caches, freeing app servers for dynamic requests and cutting user latency."
+  concept: cdn
+  day: 2
+- id: lb-health-checks
+  front: "What happens to requests routed to a crashed instance if the load balancer has no health checks?"
+  back: "They keep failing, because the balancer keeps sending its share of traffic to the dead instance. Health checks remove it from rotation within seconds."
+  concept: health-checks
+  day: 2
+
+# Day 3
+- id: missing-index-symptom
+  front: "Database CPU is pegged and p99 is seconds, but QPS is modest. What do you check first?"
+  back: "The query plan of the hottest query. A sequential scan on a large table where an index seek was expected multiplies the cost of every read."
+  concept: query-plans
+  day: 3
+- id: index-write-cost
+  front: "Why not index every column?"
+  back: "Each index must be updated on every insert and update, costing write throughput and storage, and unused indexes still compete for memory. Index the columns your queries filter and sort on."
+  concept: database-indexes
+  day: 3
+- id: composite-order
+  front: "An index on (user_id, created_at) exists. Does it help WHERE created_at > X?"
+  back: "Not efficiently. Composite indexes serve leftmost prefixes, so it helps filters on user_id, or user_id plus created_at, but not created_at alone."
+  concept: composite-indexes
+  day: 3
+- id: acid-when
+  front: "Give a case where losing ACID transactions would be unacceptable."
+  back: "Moving money between accounts: the debit and credit must commit together or not at all, and concurrent transfers must not see each other's partial state."
+  concept: acid-transactions
+  day: 3
+- id: nosql-choice
+  front: "What should drive a choice between a relational database and a key-value store?"
+  back: "Access patterns and consistency needs: joins, ad-hoc queries and multi-row transactions favour relational; very high write volume on simple key lookups favours key-value. Popularity is not a criterion."
+  concept: sql-vs-nosql
+  day: 3
+
+# Day 4
+- id: cache-aside-flow
+  front: "Describe the read and write paths of cache-aside."
+  back: "Read: check cache, on miss read the database and set the cache with a TTL. Write: update the database, then delete the cache key so the next read repopulates it."
+  concept: cache-aside
+  day: 4
+- id: delete-not-update
+  front: "On a write, why delete the cache key instead of updating it with the new value?"
+  back: "Two concurrent writers can set the cache in the opposite order from the database commits, leaving the wrong value cached indefinitely. Deleting lets the next read fetch the committed value."
+  concept: cache-invalidation
+  day: 4
+- id: ttl-safety-net
+  front: "If you invalidate on every write, why still set a TTL?"
+  back: "Invalidation can be missed: a crashed process, a race or a write path that forgot to delete. A TTL bounds how long any such mistake can serve stale data."
+  concept: ttl
+  day: 4
+- id: write-back-risk
+  front: "What is the main risk of a write-back cache?"
+  back: "Acknowledged writes live only in the cache until flushed, so a cache node failure loses them. Use it only where some loss is acceptable or the cache is replicated and persisted."
+  concept: write-back-cache
+  day: 4
+- id: write-through-tradeoff
+  front: "What do you gain and pay with write-through caching?"
+  back: "Reads after writes always hit a fresh cache; every write pays the latency of both the cache and the database, and rarely read data still fills the cache."
+  concept: write-through-cache
+  day: 4
+
+# Day 5
+- id: estimate-before-design
+  front: "Why estimate QPS and storage before drawing boxes?"
+  back: "The numbers decide the design: 100 QPS fits one database, 100k QPS needs caching and partitioning. Estimating first prevents both over-engineering and designs that cannot work."
+  concept: back-of-the-envelope-estimation
+  day: 5
+- id: dau-to-qps
+  front: "100 million DAU each make 10 requests a day. What is the average and peak QPS?"
+  back: "10^9 requests / 86,400 s is about 12k QPS average. With a 2-3x daily peak, plan for about 25-35k QPS."
+  concept: back-of-the-envelope-estimation
+  day: 5
+- id: read-heavy-shortener
+  front: "A URL shortener has a 100:1 read-to-write ratio. Which component matters most?"
+  back: "The read path: a cache in front of the database for code-to-URL lookups, since redirects dominate traffic and the mapping is immutable and highly cacheable."
+  concept: cache-aside
+  day: 5
+
+# Day 6
+- id: stateless-prerequisite
+  front: "What must be true of an app tier before you can scale it horizontally?"
+  back: "It must be stateless: sessions and per-user data live in a shared store or token, so any instance can serve any request and instances can be added or killed freely."
+  concept: stateless-services
+  day: 6
+- id: autoscaling-lag
+  front: "Autoscaling is configured, yet a sudden 5x spike still causes errors. Why?"
+  back: "Scaling reacts after the metric crosses a threshold, and new instances need time to boot and warm up. The spike lands before capacity arrives; keep headroom or a warm pool."
+  concept: autoscaling
+  day: 6
+- id: vertical-limits
+  front: "When is vertical scaling the right first move?"
+  back: "When load is modest and the bottleneck is a component that is hard to distribute, such as a single database. It is fast and simple, but has a ceiling and keeps the single point of failure."
+  concept: vertical-scaling
+  day: 6
+- id: horizontal-db
+  front: "Adding app servers did not reduce p99. What does that tell you?"
+  back: "The bottleneck is downstream, typically the database. More app instances only add more concurrent queries to the saturated tier."
+  concept: horizontal-scaling
+  day: 6
+
+# Day 7
+- id: replicas-dont-scale-writes
+  front: "Why do read replicas not help a write-bound database?"
+  back: "Every write must still be applied on the primary and then replayed on every replica. Replicas multiply read capacity only; writes need batching, queues or sharding."
+  concept: read-replicas
+  day: 7
+- id: connection-limits
+  front: "Why can doubling app instances crash a healthy Postgres primary?"
+  back: "Each instance opens its own pool, so connection count doubles. Postgres uses a process per connection and degrades past a few hundred; use a pooler and cap pool sizes."
+  concept: connection-pooling
+  day: 7
+- id: rw-split-exception
+  front: "In a read/write split, which reads should still go to the primary?"
+  back: "Reads that must reflect a write the same user just made, such as viewing your profile after saving it, plus reads inside a transaction that also writes."
+  concept: read-write-split
+  day: 7
+- id: lsm-write-heavy
+  front: "Why do write-heavy stores like Cassandra use LSM trees instead of B-trees?"
+  back: "LSM trees turn random writes into sequential appends and batch flushes, giving much higher write throughput. The cost is read amplification and background compaction."
+  concept: lsm-tree
+  day: 7
+
+# Day 8
+- id: stale-profile-cause
+  front: "A user updates their profile and the page still shows the old name. What is the likely cause and fix?"
+  back: "The read went to an async replica that had not applied the write yet. Route that user's reads to the primary for a short window after a write, or track the write's position and wait for it."
+  concept: read-your-writes
+  day: 8
+- id: async-failover-loss
+  front: "What data can you lose when failing over to an asynchronous replica?"
+  back: "Any writes the primary acknowledged but had not yet shipped, typically up to the replication lag at the moment of failure. That lag is your effective RPO."
+  concept: sync-vs-async-replication
+  day: 8
+- id: lag-under-load
+  front: "Why does replication lag grow when the primary is busy?"
+  back: "Replicas replay changes with limited parallelism and compete for the same I/O; heavy write bursts or long transactions produce changes faster than replicas can apply them."
+  concept: replication-lag
+  day: 8
+- id: cap-misread
+  front: "What does the CAP theorem actually force you to choose, and when?"
+  back: "Only during a network partition: either reject some requests to stay consistent, or keep serving with possibly stale data. Outside partitions you can have both."
+  concept: cap-theorem
+  day: 8
+- id: pacelc-normal
+  front: "What trade-off does PACELC add that CAP ignores?"
+  back: "Even with no partition, stronger consistency costs latency because replicas must coordinate. Most real choices are latency versus consistency on every request."
+  concept: pacelc
+  day: 8
+- id: quorum-overlap
+  front: "With N = 3, why does W = 2, R = 2 give up-to-date reads?"
+  back: "W + R = 4 > 3, so any read set of 2 replicas must overlap the write set of 2 in at least one replica holding the latest version."
+  concept: quorum
+  day: 8
+- id: eventual-where-fine
+  front: "Name a feature where eventual consistency is fine and one where it is not."
+  back: "Fine: like counts or follower counts lagging a few seconds. Not fine: an account balance used to authorise a withdrawal, or uniqueness of a username."
+  concept: eventual-consistency
+  day: 8
+- id: linearizable-cost
+  front: "Why is linearizability expensive in a geo-distributed system?"
+  back: "Every operation must be ordered with respect to all others, so writes and often reads need a round of coordination across replicas, paying inter-region latency."
+  concept: linearizability
+  day: 8
+
+# Day 9
+- id: stampede-top-of-hour
+  front: "Why does a cache stampede happen at :00?"
+  back: "Keys written by an hourly job, or all with the same TTL, expire at the same instant. Every request that misses goes to the database at once; add TTL jitter and request coalescing."
+  concept: cache-stampede
+  day: 9
+- id: single-flight
+  front: "How does request coalescing protect the database on a hot miss?"
+  back: "Only the first request for a missing key fetches from the database; concurrent requests for the same key wait for that result instead of issuing their own queries."
+  concept: cache-stampede
+  day: 9
+- id: hot-key-fix
+  front: "One Redis node is at 100% CPU while others idle. What is happening and how do you fix it?"
+  back: "A hot key maps to that node. Cache it in-process on app servers for a short TTL, or replicate it under several suffixed keys and read a random copy."
+  concept: hot-key
+  day: 9
+- id: hit-ratio-leverage
+  front: "Why is raising cache hit ratio from 95% to 99% a big deal?"
+  back: "Database load follows the miss ratio: 5% to 1% is a 5x reduction in database reads, often the difference between needing replicas and not."
+  concept: cache-hit-ratio
+  day: 9
+- id: lru-vs-lfu
+  front: "A nightly batch job reads every key once and your cache hit ratio collapses. Which eviction policy resists this?"
+  back: "LFU, or LRU with scan resistance. Plain LRU lets one-off reads evict the frequently used working set."
+  concept: lru-eviction
+  day: 9
+- id: warm-before-traffic
+  front: "Why warm a new cache cluster before shifting traffic to it?"
+  back: "A cold cache misses on everything, sending the full read load to the database at once. Warming, or ramping traffic gradually, avoids a self-inflicted stampede."
+  concept: cache-warming
+  day: 9
+
+# Day 10
+- id: queue-absorbs-burst
+  front: "How does a queue let a database survive a write burst it cannot absorb directly?"
+  back: "Producers enqueue in milliseconds and get acknowledged; workers drain at a rate the database sustains. The burst becomes backlog that clears afterwards instead of rejected writes."
+  concept: message-queue
+  day: 10
+- id: queue-not-magic
+  front: "When does adding a queue not solve an overload?"
+  back: "When the sustained arrival rate exceeds the drain rate. The backlog then grows without bound; you need more consumer capacity or to shed load."
+  concept: back-pressure
+  day: 10
+- id: kafka-ordering
+  front: "How do you keep all events for one order in sequence in Kafka?"
+  back: "Use the order ID as the message key so all its events land in the same partition, which is strictly ordered. There is no ordering across partitions."
+  concept: kafka-partition
+  day: 10
+- id: consumer-parallelism
+  front: "You add 20 consumers to a group reading a 12-partition topic. How many do work?"
+  back: "Twelve. Each partition is assigned to one consumer in the group, so the extra eight sit idle. Partition count caps consumer parallelism."
+  concept: consumer-group
+  day: 10
+- id: pubsub-vs-queue
+  front: "What is the difference between a work queue and pub/sub?"
+  back: "In a work queue each message is processed by one consumer; in pub/sub every subscriber gets its own copy. Kafka does both: one group behaves as a queue, several groups as pub/sub."
+  concept: pub-sub
+  day: 10
+- id: dlq-purpose
+  front: "Why route repeatedly failing messages to a dead-letter queue?"
+  back: "A poison message retried forever blocks its partition or burns capacity. Moving it aside after N attempts keeps the stream flowing and preserves it for inspection."
+  concept: dead-letter-queue
+  day: 10
+
+# Day 11
+- id: n-plus-one
+  front: "You need 4 servers to handle peak. How many should you run?"
+  back: "At least 5 (N+1), so losing one at peak does not overload the rest. Across availability zones, size so a full zone loss still leaves enough capacity."
+  concept: redundancy
+  day: 11
+- id: failover-requires-replica
+  front: "The database primary dies at 3 am. What determines whether you have a blip or an outage?"
+  back: "Whether a replica exists and promotion is automated. With automatic failover, it is seconds of errors; without it, the outage lasts until a human restores or promotes."
+  concept: failover
+  day: 11
+- id: rto-vs-rpo
+  front: "What is the difference between RTO and RPO?"
+  back: "RTO is how long you may be down; RPO is how much data, measured in time, you may lose. Sync replication drives RPO toward zero; automated failover drives RTO down."
+  concept: rto-rpo
+  day: 11
+- id: slo-below-100
+  front: "Why should an SLO never be 100%?"
+  back: "Perfect reliability is unattainable and infinitely expensive, and users cannot tell 99.99% from 100% through their own unreliable networks. The gap is the error budget that funds change."
+  concept: slo-sli-sla
+  day: 11
+- id: error-budget-use
+  front: "Your 99.9% monthly SLO budget is 80% spent by day 10. What does an error budget policy say to do?"
+  back: "Slow or freeze risky launches and prioritise reliability work until the burn rate returns to normal. The budget turns reliability into an explicit trade-off with velocity."
+  concept: error-budget
+  day: 11
+
+# Day 12
+- id: offset-pagination-cost
+  front: "Why does OFFSET 1000000 LIMIT 20 get slow, and what replaces it?"
+  back: "The database must walk and discard a million rows to find the page. Cursor pagination seeks directly with WHERE id > last_seen ORDER BY id LIMIT 20."
+  concept: cursor-pagination
+  day: 12
+- id: rate-limit-key
+  front: "What should you rate limit by: IP, user or API key?"
+  back: "The most specific stable identity available: API key or user for authenticated traffic, IP or device signals for anonymous traffic. IP alone punishes shared NATs and is easy to rotate."
+  concept: rate-limiting
+  day: 12
+- id: token-bucket-burst
+  front: "A token bucket has capacity 100 and refill 10/s. What does a client experience?"
+  back: "It can burst up to 100 requests at once, then sustain 10 requests per second. Capacity sets burst tolerance; refill rate sets the long-run limit."
+  concept: token-bucket
+  day: 12
+- id: fixed-window-edge
+  front: "What is the weakness of a fixed-window rate limiter?"
+  back: "A client can send the full limit at the end of one window and again at the start of the next, doubling the rate across the boundary. Sliding windows smooth this."
+  concept: sliding-window-counter
+  day: 12
+- id: put-idempotent
+  front: "Why is a POST that creates a payment dangerous to retry, and how do APIs make it safe?"
+  back: "A retry after a timeout may create a second payment. The client sends an idempotency key; the server stores the first result under it and returns that result on retries."
+  concept: idempotency-key
+  day: 12
+
+# Day 13
+- id: timeout-shorter-than-caller
+  front: "How should timeouts relate across a call chain?"
+  back: "Each callee's timeout should be shorter than its caller's, ideally propagated as a deadline. Otherwise callers give up while downstream work continues uselessly."
+  concept: timeout
+  day: 13
+- id: retry-amplification
+  front: "Three layers each retry failed calls 3 times. What happens to the bottom service during an outage?"
+  back: "Up to 3^3 = 27 calls per user request. Retry at one layer only, cap attempts and use a retry budget so retries cannot multiply load."
+  concept: retry-storm
+  day: 13
+- id: jitter-why
+  front: "Why add jitter to exponential backoff?"
+  back: "Without randomness, clients that failed together retry together, producing synchronized waves. Jitter spreads retries over time so the dependency can recover."
+  concept: exponential-backoff
+  day: 13
+- id: breaker-half-open
+  front: "What is the half-open state of a circuit breaker for?"
+  back: "After the cool-down, it lets a few trial requests through. Success closes the breaker; failure reopens it, so the dependency is probed without being flooded."
+  concept: circuit-breaker
+  day: 13
+- id: bulkhead-why
+  front: "One slow downstream API exhausts your thread pool and every endpoint goes down. What pattern prevents this?"
+  back: "Bulkheads: give each dependency its own bounded pool or concurrency limit so a slow one can only exhaust its own slice."
+  concept: bulkhead
+  day: 13
+- id: degrade-feed
+  front: "The recommendation service is down. What should the home page do?"
+  back: "Degrade gracefully: show a cached or popular-items fallback rather than an error. Decide in advance which features are optional."
+  concept: graceful-degradation
+  day: 13
+
+# Day 14
+- id: websocket-scaling
+  front: "What makes WebSocket servers harder to scale than HTTP servers?"
+  back: "Connections are long-lived and stateful, so you must track which server holds each user, route messages between servers via pub/sub, and drain connections carefully on deploy."
+  concept: websockets
+  day: 14
+- id: chat-ordering
+  front: "How do you guarantee messages in a chat conversation display in order?"
+  back: "Assign a per-conversation sequence number at a single writer (or partition by conversation) and have clients sort and detect gaps by sequence, not by device clock."
+  concept: message-ordering
+  day: 14
+- id: chat-delivery-dedup
+  front: "Chat delivery is at-least-once. How do clients avoid showing duplicates?"
+  back: "Each message carries a client-generated ID; the server and receivers dedupe on it, so a resend after a lost ack is recognised and dropped."
+  concept: delivery-semantics
+  day: 14
+- id: long-poll-when
+  front: "When is long polling still a reasonable choice?"
+  back: "When messages are infrequent, infrastructure or proxies block persistent connections, or as a fallback transport. It costs a request per message or timeout."
+  concept: long-polling
+  day: 14
+
+# Day 15
+- id: celebrity-fanout
+  front: "Why do news feeds use a hybrid of fan-out on write and fan-out on read?"
+  back: "Pushing a celebrity's post to 50 million timelines is too expensive, so their posts are pulled and merged at read time, while ordinary users' posts are pushed."
+  concept: fan-out-on-read
+  day: 15
+- id: fanout-write-benefit
+  front: "What does fan-out on write buy you?"
+  back: "Timeline reads become a single lookup of a precomputed list, which suits read-heavy feeds. The cost moves to writes and storage."
+  concept: fan-out-on-write
+  day: 15
+
+# Day 16
+- id: lock-needs-fencing
+  front: "A lock holder pauses for 30 s in GC; its lease expires and another node takes the lock. How do you stop the first from corrupting data when it wakes?"
+  back: "Fencing tokens: each grant carries an increasing number and storage rejects writes with a token older than the newest it has seen."
+  concept: fencing-token
+  day: 16
+- id: lease-vs-lock
+  front: "Why do distributed locks use leases with expiry?"
+  back: "A holder can crash without releasing. Expiry guarantees progress, but it means the lock can be lost while the holder still believes it owns it."
+  concept: distributed-lock
+  day: 16
+- id: raft-majority
+  front: "Why does a 5-node Raft cluster tolerate 2 failures but a 4-node cluster only 1?"
+  back: "Progress requires a majority. Five nodes need 3, so 2 can fail; four nodes need 3, so only 1 can fail. Even sizes add cost without adding tolerance."
+  concept: raft
+  day: 16
+- id: split-brain
+  front: "What is split brain and how does consensus prevent it?"
+  back: "Two nodes both believe they are leader and accept conflicting writes. Requiring a majority vote per term means at most one leader can be elected in any term."
+  concept: leader-election
+  day: 16
+- id: ot-vs-crdt
+  front: "Collaborative editing: OT or CRDT?"
+  back: "OT relies on a central server to order and transform operations, which suits a hosted editor. CRDTs merge in any order without a coordinator, which suits offline and peer-to-peer editing at the cost of metadata."
+  concept: crdt
+  day: 16
+- id: ot-server
+  front: "Why does operational transformation fit a client-server editor like Google Docs?"
+  back: "The server is the single source of operation order, so every client transforms its pending edits against the same sequence and converges."
+  concept: operational-transformation
+  day: 16
+
+# Day 17
+- id: dual-write-problem
+  front: "Why not just write to the database and then publish to Kafka in the same request handler?"
+  back: "If the process crashes between the two, one happens without the other. The outbox pattern writes the event in the same transaction and relays it afterwards."
+  concept: outbox-pattern
+  day: 17
+- id: saga-compensation
+  front: "In an order saga, payment succeeds but inventory reservation fails. What happens?"
+  back: "The saga runs compensating actions for completed steps, here refunding the payment. Sagas give eventual atomicity, not isolation, so intermediate states are visible."
+  concept: saga-pattern
+  day: 17
+- id: why-not-2pc
+  front: "Why do microservice architectures prefer sagas over two-phase commit?"
+  back: "2PC holds locks across services and blocks if the coordinator fails, coupling availability of all participants. Sagas use local transactions and compensation instead."
+  concept: two-phase-commit
+  day: 17
+- id: exactly-once-myth
+  front: "Is exactly-once delivery possible over a network?"
+  back: "Not in general; a lost ack forces a choice between losing or duplicating. Systems achieve exactly-once effects through at-least-once delivery plus idempotent processing."
+  concept: exactly-once-semantics
+  day: 17
+- id: ledger-append-only
+  front: "Why do payment systems store an append-only double-entry ledger instead of updating a balance column?"
+  back: "Every change is an auditable pair of entries that must sum to zero, so errors are detectable and history is never lost. Balances are derived from, and reconciled against, the ledger."
+  concept: double-entry-ledger
+  day: 17
+- id: idempotency-key-storage
+  front: "What must the server store for an idempotency key to work?"
+  back: "The key, a hash of the request and the final response, written atomically with the side effect. A retry with the same key returns the stored response; a different payload is rejected."
+  concept: idempotency-key
+  day: 17
+
+# Day 18
+- id: active-active-conflicts
+  front: "What new problem does active-active multi-region introduce?"
+  back: "Concurrent writes to the same record in different regions conflict. You need a resolution rule (last-writer-wins, CRDTs, or home-region ownership per record)."
+  concept: active-active
+  day: 18
+- id: geo-routing-why
+  front: "What does routing users to the nearest region buy, and what does it cost?"
+  back: "Lower round-trip latency and regional fault isolation. The cost is replicating data across regions and deciding what happens when a user's data lives elsewhere."
+  concept: geo-routing
+  day: 18
+- id: sse-vs-ws
+  front: "For live comments viewers only read, why might SSE beat WebSockets?"
+  back: "Traffic is one-way server-to-client. SSE is plain HTTP with automatic reconnection and resume by event ID, and works well with existing proxies and load balancers."
+  concept: server-sent-events
+  day: 18
+
+# Day 19
+- id: three-pillars
+  front: "Metrics, logs and traces: which answers 'which hop made this request slow'?"
+  back: "Traces. Metrics show that p99 rose, logs show discrete events, but a trace attributes time to each span along the request path."
+  concept: distributed-tracing
+  day: 19
+- id: red-metrics
+  front: "What are the RED metrics for a service?"
+  back: "Rate (requests per second), Errors (failed requests) and Duration (latency distribution). They cover what users experience from any request-driven service."
+  concept: observability
+  day: 19
+- id: cms-topk
+  front: "How do you find the top 10 trending hashtags in a stream of billions without storing a counter per tag?"
+  back: "Count with a count-min sketch for approximate frequencies and keep a min-heap of the current top candidates, per time window."
+  concept: count-min-sketch
+  day: 19
+- id: hll-uniques
+  front: "How do you count unique daily visitors across billions of events in kilobytes of memory?"
+  back: "HyperLogLog: it estimates cardinality to around 1% error in about 12 KB, and sketches from different shards or days can be merged."
+  concept: hyperloglog
+  day: 19
+- id: bloom-use
+  front: "Where does a Bloom filter save work in a storage engine?"
+  back: "Before reading an on-disk file, check its Bloom filter; a negative answer means the key is definitely absent, skipping the disk read."
+  concept: bloom-filter
+  day: 19
+- id: windows
+  front: "What is the difference between tumbling and sliding windows?"
+  back: "Tumbling windows are fixed, non-overlapping intervals; sliding windows overlap and advance in smaller steps, giving smoother but costlier results."
+  concept: stream-processing
+  day: 19
+
+# Day 20
+- id: authn-authz
+  front: "A logged-in user can view another user's invoice by changing an ID in the URL. Which control failed?"
+  back: "Authorization. Authentication worked, but the server never checked that this identity may access that object."
+  concept: authn-vs-authz
+  day: 20
+- id: jwt-revocation
+  front: "Why are JWT access tokens kept short-lived?"
+  back: "They are verified without a database lookup, so they cannot easily be revoked. Short expiry limits the damage of a stolen token; refresh tokens, which are checked server-side, renew them."
+  concept: jwt
+  day: 20
+- id: secrets-in-code
+  front: "Why not keep database passwords in environment files committed to the repo?"
+  back: "Anyone with repo or image access gets production credentials, and rotation requires a code change. A secrets manager provides access control, auditing and rotation."
+  concept: secrets-management
+  day: 20
+- id: scraper-defence
+  front: "A scraper rotates IPs and stays under per-IP limits. What else can you use?"
+  back: "Rate limit by account, API key or device fingerprint, add behavioural detection and challenges, and serve cacheable responses from the edge so scraping is cheap to absorb."
+  concept: bot-mitigation
+  day: 20
+
+# Day 21
+- id: shard-key-celebrity
+  front: "Sharding posts by user_id, one celebrity's shard is melting. Why, and what are the options?"
+  back: "All of a hot user's traffic lands on one shard. Split that key across sub-shards with a salt, cache their reads aggressively, or give them dedicated capacity."
+  concept: hot-partition
+  day: 21
+- id: time-range-shard
+  front: "Why is sharding a write-heavy table by timestamp range usually a mistake?"
+  back: "All new writes go to the newest range, so one shard takes all write load while the rest idle."
+  concept: hash-vs-range-partitioning
+  day: 21
+- id: shard-key-choice
+  front: "What makes a good shard key?"
+  back: "High cardinality, even load distribution and alignment with the dominant query so most requests hit a single shard."
+  concept: shard-key
+  day: 21
+- id: mod-n-rehash
+  front: "Why not route keys with hash(key) mod N?"
+  back: "Changing N remaps almost every key, causing a mass cache miss or data migration. Consistent hashing moves only about 1/N of keys when a node joins or leaves."
+  concept: consistent-hashing
+  day: 21
+- id: vnodes-why
+  front: "Why add virtual nodes to a consistent hash ring?"
+  back: "With few physical nodes, ring positions are uneven and one node may own a large arc. Many virtual positions per node even out load and spread rebalancing."
+  concept: virtual-nodes
+  day: 21
+- id: sharding-cost
+  front: "What do you give up when you shard a relational database?"
+  back: "Cross-shard joins and transactions, global secondary indexes and easy rebalancing. Shard only after replicas, caching and vertical scaling are exhausted."
+  concept: sharding
+  day: 21
+
+# Day 22
+- id: presigned-upload
+  front: "Why should clients upload large videos directly to object storage rather than through API servers?"
+  back: "Streaming gigabytes through app servers ties up connections and bandwidth. A presigned URL lets the client upload straight to the object store, which then triggers processing."
+  concept: object-storage
+  day: 22
+- id: abr-why
+  front: "Why is video transcoded into multiple bitrates and short segments?"
+  back: "The player can switch rendition per segment as bandwidth changes, avoiding stalls, and segments are ordinary cacheable files that CDNs serve efficiently."
+  concept: adaptive-bitrate-streaming
+  day: 22
+
+# Day 23
+- id: geohash-neighbours
+  front: "Why must a geohash proximity search also query neighbouring cells?"
+  back: "Two nearby points can sit on either side of a cell boundary and share no prefix. Querying the cell plus its 8 neighbours covers the edge cases."
+  concept: geohash
+  day: 23
+- id: quadtree-density
+  front: "Why might a quadtree beat fixed geohash cells for driver lookup?"
+  back: "Quadtrees split dense areas into smaller cells and leave sparse areas large, so each cell holds a similar number of drivers. Fixed cells are overloaded downtown and empty in the suburbs."
+  concept: quadtree
+  day: 23
+
+# Day 24
+- id: bottleneck-first
+  front: "Under a Black Friday load test, where do you start optimising?"
+  back: "At the saturated component on the critical path, found from utilisation and latency per tier. Optimising anything else does not raise throughput."
+  concept: p99-latency
+  day: 24
+
+# Day 26
+- id: littles-law-pool
+  front: "A service handles 2,000 RPS with 50 ms average latency. How many concurrent requests are in flight?"
+  back: "Little's law: 2,000 x 0.05 = 100. Size thread pools and connection pools above this with headroom for latency spikes."
+  concept: littles-law
+  day: 26
+- id: peak-not-average
+  front: "Why plan capacity for peak rather than average load?"
+  back: "Traffic is uneven: daily peaks are 2-3x average and events can be 10x. A system sized for average fails exactly when most users are watching."
+  concept: peak-factor
+  day: 26
+- id: storage-estimate
+  front: "10 million new 500-byte records a day. Roughly how much storage per year, with 3x replication?"
+  back: "10^7 x 500 B = 5 GB/day, about 1.8 TB/year, about 5.5 TB with 3 replicas, before indexes."
+  concept: back-of-the-envelope-estimation
+  day: 26

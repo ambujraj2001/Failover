@@ -1,0 +1,272 @@
+slug: design-payment-system
+kind: problem
+title: Design a payment system
+difficulty: hard
+day: 17
+summary: Design the money-movement core of a Stripe-like processor. A ledger write may never be lost or applied twice, balances may never be stale, and the primary will die.
+topics: [payments, ledger, idempotency, outbox, failover, sync-replication, message-queue, reconciliation]
+company_tags: [Stripe, PayPal, Amazon, Uber, Square, Adyen, Coinbase, Shopify]
+estimated_minutes: 60
+incident: "Launch review · 1,500 payments/s at peak · zero tolerance for lost or double charges · design due Friday"
+
+brief_beginner: |
+  You are building **Tilly**, the system that moves money when someone pays a shop online. A
+  customer taps "Pay", Tilly asks the card network to approve it, records who owes whom, and
+  later pays the shop. Getting this wrong has a very real cost: charge someone twice, or lose
+  a record of a payment, and real people lose real money.
+
+  Think of a bank's paper ledger. Every movement of money is written as two lines that cancel
+  out: "customer −€20" and "shop +€20". This is called **double-entry bookkeeping**. If the lines
+  of the whole book do not add up to zero, something went wrong, and you can tell.
+
+  At peak Tilly handles **3,000 requests per second**: half are new payments (writes) and half
+  are status and balance checks (reads). Phones lose signal and apps retry, so the same
+  payment request can arrive two or three times. Today every payment is written straight into one
+  database with no copy. If that database dies, payments fail until someone fixes it by hand.
+
+  Words you will need. An **idempotency key** is a unique ID the client attaches to a request, so
+  that if the same request arrives twice the server recognises it and does the work only once.
+  **Failover** means a standby copy of the database (a **replica**) automatically takes over
+  when the main one (the **primary**) dies. **Synchronous replication** means a write is only
+  confirmed once the replica also has it, so no confirmed write can be lost and the replica is
+  never behind.
+
+  **Your job:** design a payment backend where no accepted payment is ever lost, a retried request
+  never charges twice, balances are never out of date, and the database primary can die without
+  customers noticing. Then explain the ledger and the retry safety in writing.
+
+brief_expert: |
+  **Functional:** create a payment (authorize → capture), refunds, query payment status and
+  merchant balance, payouts to merchants, webhooks to merchants on state changes. Integrates with
+  external payment service providers (PSPs) / card networks.
+
+  **Non-functional:** **exactly-once effect** for money movement (at-least-once delivery +
+  idempotency), no acknowledged payment lost (RPO = 0), strongly consistent balance reads, error
+  rate < 0.05%, API p99 < 150 ms (PSP calls happen asynchronously), 99.99% availability,
+  auditability.
+
+  **Scale:** 100M payments/day ≈ 1.2k/s average, **1.5k payment writes/s + 1.5k reads/s** at peak
+  (3k rps). Each payment produces ~4 ledger entries over its life; ~10 KB of state and events per
+  payment ≈ 1 TB/day. Balance and status reads are not cacheable.
+
+  The starter writes synchronously to one PostgreSQL with no replica. Make acceptance durable and
+  decoupled from the ledger's availability, use synchronous replication with automatic failover so
+  no confirmed write is lost and no read is stale, and size the ledger writers. Hidden tests kill
+  the primary and spike traffic.
+
+glossary:
+  - term: Idempotency key
+    meaning: A unique ID the client sends with a request (for example a UUID per checkout). The server stores the key with the result; a repeat of the same key returns the stored result instead of charging again.
+  - term: Double-entry ledger
+    meaning: An append-only record where every money movement is two or more entries that sum to zero (debit one account, credit another). Balances are derived from entries, never edited directly.
+  - term: Transactional outbox
+    meaning: Writing the business change and an "event to publish" in the same database transaction, then publishing events from that table. The event is published if and only if the change committed.
+  - term: Synchronous replication
+    meaning: The primary waits until a replica has the write before confirming it. Slightly slower writes, but a replica that takes over has every confirmed write.
+  - term: Reconciliation
+    meaning: Regularly comparing your ledger against the bank's and PSP's settlement files to find and fix any mismatch.
+
+requirements:
+  - p99 latency under 150 ms at 3,000 req/s (50% payment writes)
+  - Error rate under 0.05%
+  - No lost payments (0% write loss) and no stale balance reads (under 0.1%)
+  - Ledger lag under 5 s normally; the primary dying must not lose or reject payments
+  - Stay within $3.90/hr
+
+budget: 3.9
+palette: [load_balancer, app_server, database, queue, worker]
+
+starter:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Payments API, config: {size: large, instances: 4}, position: {x: 480, y: 160}}
+    - {id: db, type: database, label: Ledger DB, config: {size: large, indexes: "id, account_id"}, position: {x: 720, y: 160}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Payments API, config: {size: large, instances: 7}, position: {x: 480, y: 160}}
+    - {id: log, type: queue, label: Payment events, config: {partitions: 4}, position: {x: 720, y: 300}}
+    - {id: workers, type: worker, label: Ledger writers, config: {size: large, instances: 4}, position: {x: 960, y: 300}}
+    - {id: db, type: database, label: Ledger DB, config: {size: xlarge, indexes: "id, account_id", replicas: 1, replication: sync, failover: true}, position: {x: 1200, y: 160}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: db}
+    - {source: api, target: log}
+    - {source: log, target: workers}
+    - {source: workers, target: db}
+
+tests:
+  - id: peak-checkout
+    name: Peak checkout
+    summary: 3,000 req/s, half payments, half status and balance reads
+    scenario:
+      base_rps: 3000
+      read_ratio: 0.5
+      cacheable: 0
+      working_set_gb: 20
+      query_column: account_id
+    assertions:
+      - {metric: p99_ms, op: lte, value: 150}
+      - {metric: error_rate, op: lte, value: 0.05}
+      - {metric: stale_read_rate, op: lte, value: 0.1}
+      - {metric: write_loss_rate, op: lte, value: 0}
+      - {metric: queue_lag_s, op: lte, value: 5}
+  - id: primary-dies
+    name: Ledger primary dies
+    summary: The database primary crashes at t=20s
+    hidden: true
+    scenario:
+      base_rps: 3000
+      read_ratio: 0.5
+      cacheable: 0
+      working_set_gb: 20
+      query_column: account_id
+      events: [{at: 20, type: kill_db_primary, label: "Ledger DB primary: kernel panic"}]
+    assertions:
+      - {metric: error_rate, op: lte, value: 0.05}
+      - {metric: write_loss_rate, op: lte, value: 0}
+      - {metric: stale_read_rate, op: lte, value: 0.1}
+      - {metric: queue_lag_s, op: lte, value: 10}
+  - id: flash-sale
+    name: Flash sale
+    summary: Checkout traffic jumps 60% for 20 seconds
+    hidden: true
+    scenario:
+      base_rps: 3000
+      read_ratio: 0.5
+      cacheable: 0
+      working_set_gb: 20
+      query_column: account_id
+      spikes: [{at: 20, duration: 20, multiplier: 1.6, ramp: 3}]
+    assertions:
+      - {metric: error_rate, op: lte, value: 0.1}
+      - {metric: p99_ms, op: lte, value: 150}
+      - {metric: write_loss_rate, op: lte, value: 0}
+      - {metric: queue_lag_s, op: lte, value: 10}
+
+hints:
+  - Count the work on the database. 1,500 payment writes/s at 1.5 units each plus 1,500 reads/s is more than one large node does, and every API request waits on it synchronously. Then ask what happens to a payment that arrives while the only database is down.
+  - Make accepting a payment independent of the ledger being up. App → Queue (a durable payment-event log) → Workers → Ledger DB lets the API acknowledge with a payment ID in milliseconds; workers apply ledger entries idempotently, and if the database rejects a write the event stays in the log and is retried.
+  - Give the database a replica with automatic failover so an outage lasts seconds, not forever, and make replication synchronous so a promoted replica has every confirmed write and balance reads are never stale. Size the ledger writers to catch up quickly after the outage and during a sale.
+
+design_prompt: |
+  Answer in writing. Be exact: this is money.
+
+  1. **API and idempotency.** Define `POST /payments` (with an `Idempotency-Key` header), `GET
+     /payments/{id}` and refunds. Where and how do you store idempotency keys (schema, uniqueness
+     constraint, TTL)? What exactly happens when the same key arrives twice concurrently, and when it
+     arrives with a different request body?
+  2. **Ledger data model.** Design a double-entry ledger: tables for accounts, journal entries and
+     postings, with the invariant that the postings of every entry sum to zero. Show the entries for
+     a €20 payment captured, a €2 fee, and a later €20 refund. How do you compute a merchant's
+     balance efficiently without ever updating rows in place?
+  3. **Payment state machine and the PSP.** Give the states (created, authorized, captured, failed,
+     refunded, ...) and the allowed transitions. The call to the external PSP times out: did the
+     charge happen? How do you resolve unknown outcomes without double-charging (idempotent PSP
+     calls, status queries, retries with backoff)?
+  4. **Exactly-once effects across systems.** How do you guarantee that a ledger write and the event
+     that triggers a webhook or payout either both happen or neither does? Explain the transactional
+     outbox (or an alternative) and how consumers de-duplicate.
+  5. **Failure and consistency.** Why synchronous replication for the ledger (state RPO and RTO)?
+     What does a client see during the 12 s failover? How does daily reconciliation against PSP and
+     bank settlement files work, and what do you do with a mismatch?
+
+editorial: |
+  ### 1. Requirements
+  * **Functional:** create/authorize/capture/refund payments, status and balance queries, payouts,
+    merchant webhooks.
+  * **Non-functional:** correctness first. No lost acknowledged payments (RPO 0), no double charges
+    (idempotency end to end), strongly consistent reads of money, auditable history, then latency
+    and cost.
+
+  ### 2. Estimation
+  | quantity | value |
+  |---|---|
+  | payments | 100M/day ≈ 1.2k/s average; 1.5k/s at the modelled peak |
+  | reads | status polls and balance checks ≈ 1.5k/s, not cacheable |
+  | ledger entries | ~4 per payment → ~6k postings/s at peak, batched per payment transaction |
+  | storage | ~10 KB/payment across state, events and postings ≈ 1 TB/day, retained for years (audit) |
+
+  ### 3. High-level design
+  ```
+  Client ─(Idempotency-Key)→ LB → Payments API ─► Payment events (Kafka, keyed by payment_id) → 202 + payment_id
+                                     │                └→ Ledger writers (idempotent) → Ledger DB
+                                     └─► Ledger DB (status / balance reads)    primary + sync replica, auto-failover
+  Ledger DB outbox → PSP workers, webhook dispatcher, payout batcher        nightly reconciliation job
+  ```
+
+  ### 4. Why the starter fails
+  2,250 write units + 1,500 reads = 3,750 units/s on a 3,500/s large node: it saturates and requests
+  time out. Worse, it is a single copy: when it dies, every payment is rejected until a human
+  intervenes, and anything not yet flushed is gone.
+
+  ### 5. The fix, with numbers
+  * **Durable intake:** the API validates, checks the idempotency key, appends the payment event to a
+    replicated log (~2 ms) and returns `202 Accepted` with the payment ID. Acceptance no longer
+    depends on the ledger database being up.
+  * **Ledger writers:** four large workers apply ~3,000 events/s against 1,500 arriving (50% busy).
+    The spare capacity is for catching up after an outage, not for the steady state.
+    Each event is applied in one transaction that inserts the postings and records the event ID in a
+    `processed_events` table with a unique constraint, so a redelivered event is a no-op.
+  * **Ledger DB:** xlarge primary plus one **synchronous** replica with automatic failover. Writes
+    ~2,250 units plus half the reads: under 40% busy. No stale reads, because the replica is never
+    behind.
+
+  ### 6. Deep dives
+  **Idempotency.** `idempotency_keys(merchant_id, key) PRIMARY KEY, request_hash, status,
+  response, created_at`, inserted in the same transaction as the payment row. Concurrent duplicates
+  block on the unique key; the loser returns the winner's stored response. Same key with a different
+  body → `422`. Keep keys for at least 24 h (Stripe's window).
+
+  **Double entry.** `accounts`, `journal_entries(id, payment_id, type, created_at)`,
+  `postings(entry_id, account_id, amount, currency)`. Every entry's postings sum to zero, enforced in
+  the writer and checked by a nightly job. Capture of €20 with a €2 fee: customer_funds −20,
+  merchant_payable +18, fee_revenue +2. Refund: the reverse entry; nothing is ever updated or
+  deleted. Balances come from running totals maintained in the same transaction, or from
+  periodic snapshots plus postings after them.
+
+  **PSP calls.** Send the PSP an idempotency key derived from the payment ID. On timeout, mark the
+  payment `unknown`, query the PSP's status endpoint, and retry with the same key: never create a
+  new charge to "try again".
+
+  **Outbox.** The ledger writer inserts postings and an `outbox` row in one transaction; a relay
+  publishes outbox rows to webhooks and payouts and marks them sent. Consumers de-duplicate by event
+  ID. This avoids the dual-write problem (DB commit succeeds, publish fails, or the reverse).
+
+  **Reconciliation.** Daily, match every ledger entry to PSP and bank settlement lines by reference;
+  unmatched or mismatched items go to an exceptions queue for automated retry or human review.
+
+  ### 7. What the hidden tests probe
+  * **Primary dies:** with synchronous writes from the API, 12 s of failover means 12 s of rejected
+    payments (~10% of the run's writes). With the event log, payments keep being accepted; the
+    writers retry rejected events and catch up within seconds of promotion (peak lag ~5 s; with
+    three writers ~7.5 s, with two it passes 10 s). Without
+    failover the backlog never drains and lag passes 10 s. Without a replica, balance reads fail too.
+  * **Flash sale (1.6×):** 2,400 events/s stay under the writers' ~3,000/s, so the log barely
+    builds up. The API runs ~80% busy at the peak; six instances pass the visible test but saturate
+    here and blow the latency limit.
+
+  ### 8. Common mistakes
+  * Retrying payments without an idempotency key (double charges).
+  * Updating a `balance` column in place with no entries behind it (no audit trail, lost updates).
+  * Async replicas for money: a failover can lose acknowledged payments, and reads can be stale.
+  * Publishing events and writing the database as two separate steps (dual writes).
+  * Calling the PSP synchronously inside the request with long timeouts, so a slow PSP takes the
+    API down.
+
+  ### 9. What good answers look like
+  * **E4:** idempotency keys, a ledger table, a replica with failover, retries.
+  * **E5:** double-entry with the zero-sum invariant, payment state machine, outbox, idempotent
+    consumers, unknown-outcome handling with the PSP, sync replication and RPO 0, reconciliation.
+  * **E6:** all of the above plus sharding the ledger by account while keeping each entry on one
+    shard (or a two-phase approach for cross-shard transfers), hot merchant accounts (sub-ledgers
+    and periodic roll-ups), multi-currency and FX, regulatory retention and immutability, and a
+    plan for verifying correctness continuously rather than once a day.

@@ -1,0 +1,251 @@
+slug: design-top-k-trending
+kind: problem
+title: Design top-K trending
+difficulty: hard
+day: 19
+summary: Rank trending hashtags from a firehose of events. Ingest through a queue, aggregate with workers on hot-key-aware shards, and serve a tiny, cacheable top-K.
+topics: [stream-processing, top-k, count-min-sketch, heavy-hitters, sliding-windows, sharding, hot-keys, message-queue, caching]
+company_tags: [Twitter/X, TikTok, YouTube, Instagram, Amazon]
+estimated_minutes: 45
+incident: "Design review · 2M events/s at peak · trending page ships next sprint"
+
+brief_beginner: |
+  Every time someone watches, likes or shares a video, the app sends a tiny note to your servers:
+  *"someone just engaged with #worldcup"*. These notes are called **events**. You want a page that
+  shows the **top 10 trending hashtags** right now.
+
+  The tricky part is the shape of the traffic. Writing is enormous and reading is tiny:
+
+  - **95% of requests are events** pouring in, thousands every second, and they never stop.
+  - **5% are people opening the trending page**, and they all want the same short list.
+
+  Two more problems. When something big happens, one hashtag (say #worldcup) can be a third of all
+  events. Whatever box is responsible for counting #worldcup gets buried. That is a **hot key**.
+  And counting every single hashtag exactly, forever, would need huge amounts of memory, so real
+  systems count *approximately* and only keep a recent **window** (the last hour, the last day).
+
+  Today every event is written straight into one PostgreSQL database, and every trending-page
+  request re-computes the ranking by scanning the counts. The database is many times over capacity.
+
+  **Your job:** take events in through a buffer, count them with background workers in a way that a
+  hot hashtag cannot overload, and serve the small top-10 list from somewhere fast. Then explain how
+  you would count approximately and over time windows.
+
+brief_expert: |
+  **Functional:** ingest engagement events `(item_id, hashtags[], region, ts)`; expose
+  `GET /trending?region=&window=1h|24h&k=10..100`; results refresh at least once a minute; support
+  per-region and global rankings.
+
+  **Non-functional:** 500M DAU, ~2M events/s at peak, ~100M distinct hashtags per day, heavy Zipf
+  skew (the top tag can be 30% of events during a world event, 60% in the extreme). Trending reads
+  ~50k req/s globally, highly cacheable. Freshness: under 60 s behind real time. Approximate counts
+  are acceptable for ranking; exact counts are needed for creator analytics (separate batch path).
+
+  **Graded part:** one ingest region at 6,000 req/s, 95% events, 5% top-K reads (0.5 GB of
+  precomputed rankings). Event handlers are light (`app_work` 0.5). The ranking query has no index:
+  computing it on demand is a scan, so serve it precomputed. The top tag takes 30% of events.
+  Keep the ingest API as sized; the budget rules out four extra-large hash-sharded databases.
+
+glossary:
+  - term: Top-K
+    meaning: The K items with the highest counts, for example the 10 most-used hashtags in the last hour.
+  - term: Heavy hitter
+    meaning: An item that appears far more often than the rest. Trending is about finding heavy hitters quickly.
+  - term: Count-min sketch
+    meaning: A small fixed-size table of counters that estimates how often each item appeared. It can overcount a little but never undercounts, and uses kilobytes instead of gigabytes.
+  - term: Sliding window
+    meaning: Counting only the last N minutes, so old events stop counting as time moves on.
+  - term: Key salting
+    meaning: Splitting one hot key into several sub-keys (#worldcup#1 … #worldcup#8) so its load spreads over several machines, then summing them when reading.
+
+requirements:
+  - "Normal day: p99 under 60 ms, error rate under 0.5%, event processing lag under 5 s"
+  - Survive a world event and a mass cache expiry (hidden tests)
+  - Stay within $4.40/hr (the ingest API stays at 9 large instances)
+
+budget: 4.4
+palette: [load_balancer, app_server, database, cache, queue, worker]
+
+starter:
+  nodes:
+    - {id: users, type: users, label: Apps, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Ingest API, config: {size: large, instances: 9}, position: {x: 480, y: 160}}
+    - {id: db, type: database, label: Counts DB, config: {size: large, indexes: "id, tag"}, position: {x: 720, y: 160}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, label: Apps, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Ingest API, config: {size: large, instances: 9}, position: {x: 480, y: 160}}
+    - {id: redis, type: cache, label: Top-K cache, config: {memory_gb: "1", ttl_s: 30, stampede_protection: true}, position: {x: 720, y: 20}}
+    - {id: queue, type: queue, label: Event log, config: {partitions: 4}, position: {x: 720, y: 300}}
+    - {id: workers, type: worker, label: Aggregators, config: {size: large, instances: 4}, position: {x: 960, y: 300}}
+    - {id: db, type: database, label: Counts DB, config: {size: large, shards: 4, shard_key: hash_split_hot, indexes: "id, tag"}, position: {x: 1200, y: 160}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: redis}
+    - {source: api, target: db}
+    - {source: api, target: queue}
+    - {source: queue, target: workers}
+    - {source: workers, target: db}
+
+tests:
+  - id: normal
+    name: A normal day
+    summary: 6,000 req/s, 95% events, the top hashtag is 30% of events
+    scenario: {base_rps: 6000, read_ratio: 0.05, cacheable: 1, hot_key_share: 0.3, working_set_gb: 0.5, app_work: 0.5, query_column: score}
+    assertions:
+      - {metric: p99_ms, op: lte, value: 60}
+      - {metric: error_rate, op: lte, value: 0.5}
+      - {metric: queue_lag_s, op: lte, value: 5}
+  - id: world-event
+    name: The final whistle
+    summary: Traffic rises 60% for 25 seconds
+    hidden: true
+    scenario:
+      base_rps: 6000
+      read_ratio: 0.05
+      cacheable: 1
+      hot_key_share: 0.3
+      working_set_gb: 0.5
+      app_work: 0.5
+      query_column: score
+      spikes: [{at: 15, duration: 25, multiplier: 1.6, ramp: 4}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 100}
+      - {metric: error_rate, op: lte, value: 0.5}
+      - {metric: queue_lag_s, op: lte, value: 14}
+      - {metric: write_loss_rate, op: lte, value: 0}
+  - id: one-tag-dominates
+    name: One hashtag takes over
+    summary: A single tag is 75% of all events
+    hidden: true
+    scenario: {base_rps: 6000, read_ratio: 0.05, cacheable: 1, hot_key_share: 0.75, working_set_gb: 0.5, app_work: 0.5, query_column: score}
+    assertions:
+      - {metric: p99_ms, op: lte, value: 60}
+      - {metric: error_rate, op: lte, value: 0.5}
+      - {metric: queue_lag_s, op: lte, value: 5}
+  - id: ranking-expiry
+    name: Every ranking expires at once
+    summary: The top-K entries all expire in the same second while traffic is 30% above normal
+    hidden: true
+    scenario:
+      base_rps: 6000
+      read_ratio: 0.05
+      cacheable: 1
+      hot_key_share: 0.3
+      working_set_gb: 0.5
+      app_work: 0.5
+      query_column: score
+      spikes: [{at: 15, duration: 30, multiplier: 1.3, ramp: 4}]
+      events: [{at: 20, type: ttl_expiry_wave}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 85}
+      - {metric: error_rate, op: lte, value: 0.5}
+
+hints:
+  - >-
+    Look at the load split: 5,700 events/s are writes, each costing 1.5 units on the primary, so the
+    database sees more than 8,500 units of writes before any reads, and every trending read is an
+    unindexed scan. No single database size fixes both. Separate the two paths: events go into a
+    durable log and are counted in the background; trending reads come from a precomputed answer.
+  - >-
+    Add a queue with enough partitions and workers that drain at least as fast as events arrive
+    (each large worker handles ~1,500 events/s at this app_work). The counts still need more write
+    capacity than one primary has, so shard them. Then ask what happens to the shard that owns the
+    hottest hashtag under a hash-by-key scheme.
+  - >-
+    Use a shard key that splits hot keys (salted counters, summed on read) so the 30% tag spreads
+    across every shard. Cache the top-K with a TTL close to your refresh interval and turn on
+    stampede protection: one hidden test expires every ranking in the same second, and each miss is a
+    scan.
+
+editorial: |
+  ### 1. Requirements (5 minutes)
+  Clarify: which windows (last 1 h, 24 h), how fresh (under a minute), K (10–100), scope (global and
+  per region), and whether counts must be exact. They need not be for ranking; creator analytics
+  can be exact via a batch job. That one answer unlocks approximate algorithms.
+
+  ### 2. Estimation
+  - 2M events/s at peak, each carrying ~2 hashtags → **4M counter increments/s**.
+  - Writing each increment to a database: impossible on one box, wasteful on many. Pre-aggregating
+    in memory for 1 s collapses duplicates: with Zipf skew, 4M increments/s becomes ~200k distinct
+    `(tag, minute)` updates/s.
+  - Exact counts for 100M tags/day at ~50 B each ≈ 5 GB/day per window bucket. A count-min sketch
+    with ε = 0.01%, δ = 0.1% is ~7 rows × 27k columns ≈ **750 KB**. Keep a min-heap of size K next
+    to it to track the current heavy hitters.
+  - Reads: 50k req/s for a list that changes once a minute → effectively 100% cacheable.
+
+  ### 3. High-level design
+  ```
+  apps → ingest API → Kafka "events" (partitioned by item/tag hash, salted for hot tags)
+       → aggregators (Flink / Kafka Streams): per-minute tumbling counts, local pre-aggregation
+       → counts store (sharded; tag+minute buckets) and per-window sketch + top-K heap
+       → ranker job every 30–60 s: merge partial top-Ks → write "trending:{region}:{window}" to Redis
+  apps → trending API → Redis (precomputed top-K) → counts store only on a miss
+  ```
+
+  ### 4. Deep dives
+  - **Count-min sketch.** d hash rows × w counters. Increment one counter per row; estimate = min
+    across rows. Overestimates by at most εN with probability 1−δ, never underestimates, and sketches
+    **merge by addition**, so each worker keeps its own and the ranker sums them. Pair it with a
+    heap of size K (or Space-Saving / Misra-Gries) to remember *which* keys are heavy.
+  - **Sliding windows.** Keep 60 one-minute buckets per window (a ring). The 1-hour count is the sum
+    of the last 60 buckets; dropping the oldest bucket each minute expires old events. Sketches add
+    and subtract cleanly per bucket. For "trending" rather than "popular", rank by velocity (this
+    hour vs the same hour baseline), not raw count.
+  - **Heavy hitters and hot keys.** Partitioning by tag sends 30% of events to one partition and one
+    worker. Fix it in layers: pre-aggregate locally in every worker (one write per tag per second
+    instead of thousands), and salt known hot tags across N sub-keys, summing them on read.
+  - **Exactness trade-offs.** Approximate counts are fine for ranking; ties near position K may
+    flicker. Spam and bots matter more than sketch error: dedupe per user per item, and weight
+    distinct users rather than raw events. If exact numbers are shown to users, compute them in a
+    batch pipeline (Lambda / Kappa reconciliation) and label real-time numbers as estimates.
+
+  ### 5. What the hidden tests probe
+  The simulator's workers write every event; real aggregators would pre-aggregate first. The
+  simulator models the hot-key fix with the **hash + split hot keys** shard key.
+  - **Final whistle (+60%).** Workers drain at ~6,150 events/s against 9,100 arriving, so the log
+    absorbs the excess and processing falls ~12 s behind before catching up. Without the queue the
+    shards run past 100% and the API times out.
+  - **One tag takes over (75%).** With hash-by-key sharding the hot shard gets 75% + 25%/4 ≈ 81% of
+    all writes and collapses. With split hot keys every shard gets 25%.
+  - **Every ranking expires at once.** Each miss is a scan costing 15x an indexed read. Stampede
+    protection and a TTL matched to the refresh interval keep the shards out of trouble.
+
+  ### 6. Common mistakes
+  - Writing every event to a database row, or running `ORDER BY count DESC` on every page view.
+  - Sharding by tag without discussing the hot tag.
+  - Proposing a count-min sketch without a heap: the sketch answers "how many?", not "which ones?".
+  - Ignoring the window: an all-time counter never lets yesterday's tag fall off.
+
+  ### 7. What good looks like
+  - **E4:** queue in front of ingest, workers that count, a cached top-K endpoint, awareness that
+    exact counting is expensive.
+  - **E5:** per-minute buckets and sliding windows, count-min sketch plus heap with error bounds,
+    local pre-aggregation, salting for hot tags, mergeable partial results.
+  - **E6:** velocity-based trending with baselines, abuse resistance (distinct users, bot
+    filtering), real-time vs batch reconciliation, cost per million events, and failure handling
+    (replaying the log after a worker crash without double counting via checkpointed offsets).
+
+design_prompt: |
+  Answer each in a few sentences or a short sketch. Use numbers where you can.
+
+  1. **API and event schema.** Define the ingest event and the trending read endpoint (parameters
+     for region, window and K). What does the response contain, and how fresh is it?
+  2. **Counting at 2M events/s.** Describe the aggregation pipeline from the log to the ranking.
+     Where do you pre-aggregate, how are partitions keyed, and how do you stop one hot hashtag from
+     overloading a single partition, worker or shard?
+  3. **Approximate counting.** Explain how a count-min sketch works, size one for your error target,
+     and say how you recover the actual top-K items (not just their counts). When would you insist
+     on exact counts instead?
+  4. **Windows.** How do you compute "top 10 in the last hour" and "top 10 in the last 24 hours" so
+     that old events expire? How would you rank by velocity instead of raw volume?
+  5. **Failure and correctness.** An aggregator crashes and restarts. How do you avoid losing or
+     double counting events, and how do bots or a single user spamming a tag affect your ranking?

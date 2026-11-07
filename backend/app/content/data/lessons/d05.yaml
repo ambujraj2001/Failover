@@ -1,0 +1,166 @@
+- slug: how-to-approach-a-design
+  day: 5
+  title: How to approach a design
+  minutes: 10
+  summary: A repeatable sequence (requirements, estimates, API, data, high-level design, deep dives) turns a blank whiteboard into a defensible design.
+  plain: |
+    Planning a trip without a plan goes badly: you book a hotel before checking the flight dates,
+    then discover the museum is closed on Mondays. A good traveller works in an order: dates, then
+    flights, then hotels, then the day-by-day.
+
+    System design has a similar order. Following it means you never paint yourself into a corner.
+
+    1. **Requirements.** What must it do, for how many people, how fast? (Day 1.)
+    2. **Estimates.** Rough numbers: requests per second, data size. These tell you whether one
+       machine is enough or whether you need fifty. (Next lesson.)
+    3. **API.** The handful of operations the outside world can call, like
+       `POST /links` to create a short link and `GET /:code` to follow one. An **API**
+       (application programming interface) is the contract between your system and its users.
+    4. **Data model.** What you store and how you look it up: tables, keys, indexes.
+    5. **High-level design.** The boxes and arrows: load balancer, app servers, database, cache.
+       Start simple; one of each is a fine first draft.
+    6. **Deep dives.** Pick the part most likely to break and make it robust. For a link
+       shortener that is the redirect path under heavy traffic.
+    7. **Bottlenecks and failures.** Ask "what breaks first if traffic triples?" and "what happens
+       if this box dies?".
+
+    The trick is to make the simple version work first, then improve the part the numbers say
+    will hurt. Beginners often draw fifteen boxes in the first five minutes. Experienced engineers
+    draw four, explain why, and add the fifth only when they can say what problem it solves.
+  deeper: |
+    ### A 45-minute budget
+    | Phase | Minutes | Output |
+    |---|---|---|
+    | Requirements and scope | 4 to 6 | 3 to 5 features, explicit non-goals, latency/availability targets |
+    | Estimates | 3 to 5 | peak QPS (read and write), storage over N years, bandwidth |
+    | API and data model | 5 to 7 | endpoints with key params; tables or key schema with access patterns |
+    | High-level design | 8 to 10 | a working end-to-end path for each core use case |
+    | Deep dives | 15 | 2 or 3 components taken to production quality |
+    | Wrap-up | 3 to 5 | bottlenecks, failure modes, what you would do next |
+
+    ### Worked skeleton: URL shortener
+    ```
+    POST /api/links {long_url}           -> 201 {code}
+    GET  /{code}                         -> 301/302 Location: long_url
+
+    links(code PK, long_url, owner_id, created_at, expires_at)
+
+    Users -> CDN? -> LB -> API (stateless, N instances)
+                             |-> Redis (code -> url, cache-aside)
+                             |-> PostgreSQL (primary + replica, failover)
+    ```
+    Deep dives worth having: code generation (counter + base62 vs random with collision check),
+    the redirect hot path (cache hit ratio, cold-cache protection), 301 vs 302 (301 is cached by
+    browsers, which cuts load but breaks click analytics), and abuse (rate limiting creation).
+
+    ### Principles that hold up under questioning
+    - **Every box earns its place.** If you add Kafka, say which number forced it.
+    - **Design for the dominant path.** Optimise the 98% redirect path; the 2% write path can be
+      boring.
+    - **Name the trade-off when you choose.** "Async replica: cheaper reads, up to ~1 s stale; fine
+      for redirects, not for the owner's dashboard right after an edit."
+    - **Close the loop with numbers.** "4k reads/s at 95% hit ratio is 200 qps on the database,
+      well under one medium node."
+
+    ### Common failure modes
+    - Jumping to sharding or microservices before establishing that one node is insufficient.
+    - Drawing components without data flow: nobody can tell what happens on a request.
+    - Spending 20 minutes on requirements and running out of time for deep dives.
+    - Ignoring failure: no answer for "the primary just died".
+
+    ### What interviewers score
+    Structure (did you drive?), justified trade-offs, depth in at least one area, and awareness of
+    operations: monitoring, failure, cost. At senior levels they expect you to choose the deep
+    dives yourself rather than wait to be asked.
+  key_points:
+    - "Work in order: requirements, estimates, API, data model, high-level design, deep dives, bottlenecks."
+    - "Get one simple end-to-end path working before adding components."
+    - "Every component must be justified by a requirement or a number."
+    - "Spend most of the time on deep dives into the parts most likely to break."
+  concepts: [system-design-framework, api-design, data-modeling, high-level-design, deep-dive]
+
+- slug: back-of-the-envelope
+  day: 5
+  title: Back-of-the-envelope estimation
+  minutes: 11
+  summary: Rough arithmetic with powers of ten tells you whether you need one server or a hundred before you spend a minute designing.
+  plain: |
+    Before a party, you estimate food: 30 guests, about 3 slices of pizza each, 8 slices per
+    pizza, so roughly 12 pizzas. You do not need an exact number. You need to know it is 12, not 2
+    and not 200. That is a **back-of-the-envelope estimate**: quick arithmetic, rounded freely,
+    good to within a factor of two or three.
+
+    In system design the questions are:
+
+    - **How many requests per second?** This tells you how many servers you need.
+    - **How much data?** This tells you whether it fits on one disk or needs many machines.
+    - **How much bandwidth?** How many bytes per second flow in and out.
+
+    The one trick that makes this easy: **a day has about 100,000 seconds** (really 86,400). So:
+
+    - 1 million requests a day is about **10 per second**.
+    - 100 million a day is about **1,000 per second**.
+    - 1 billion a day is about **10,000 per second**.
+
+    Traffic is never flat. People sleep, then all wake up at once. The busiest moment, the
+    **peak**, is usually 2 to 3 times the average, more on special days. Always design for peak.
+
+    Example: a link shortener where people create 100 million links a month. A month is about
+    2.5 million seconds, so that is about 40 new links per second. If each link is opened 100 times,
+    that is 4,000 opens per second on average. Each link record is maybe 500 bytes. Keep links for
+    five years: 100 million × 60 months × 500 bytes = 3 terabytes. One database can hold that.
+
+    Ten lines of arithmetic, and you already know the design is about fast reads, not huge storage.
+  deeper: |
+    ### Constants to carry
+    | Quantity | Value |
+    |---|---|
+    | Seconds per day | 86,400 ≈ 10^5 |
+    | Seconds per month | ≈ 2.6 × 10^6 |
+    | Seconds per year | ≈ 3.15 × 10^7 |
+    | 1 M/day | ≈ 12/s |
+    | Peak-to-average | 2 to 3x typical, 5 to 10x for events |
+    | 1 Gbps NIC | ≈ 125 MB/s |
+    | Base62, 7 chars | 62^7 ≈ 3.5 × 10^12 codes |
+
+    ### Template
+    ```
+    write_qps   = writes_per_day / 86,400            (x peak factor)
+    read_qps    = write_qps x read_write_ratio
+    storage     = writes_per_day x 365 x years x bytes_per_record x replication
+    bandwidth   = qps x bytes_per_response
+    cache_size  = hot_fraction x daily_unique_items x bytes_per_item
+    servers     = peak_qps / per_server_qps / target_utilisation
+    ```
+
+    ### URL shortener, end to end
+    - Writes: 100 M/month ≈ 40/s average, ~100/s peak.
+    - Reads at 100:1: ~4,000/s average, ~10,000/s peak.
+    - Storage: 100 M × 60 months × 500 B = 3 TB raw, ~9 TB with 3 copies.
+    - Cache: if 20% of links get most traffic and 1 M links are active daily, 200k × 500 B = 100 MB.
+      The hot set fits in a single small Redis node with room to spare.
+    - App tier: 10k peak rps at ~500 rps per medium instance (simulator figure) at 60% target
+      utilisation is ~34 instances, or ~17 large ones.
+    - Database: with a 95% hit ratio, 500 qps of misses at peak, comfortably one medium node.
+
+    ### Sanity checks that catch mistakes
+    - **Units**: bits vs bytes (8x), per day vs per second (10^5x).
+    - **Order of magnitude against known systems**: Twitter-scale is ~6k tweets/s average, ~10^5
+      timeline reads/s. If your chat app for a startup needs 10^7 qps, recheck.
+    - **The dominant term**: estimate what matters for the decision; skip precision elsewhere.
+
+    ### When estimation misleads
+    Averages hide skew. A 3 TB dataset may have a 2 GB hot set (cheap to cache), and 10k rps may be
+    95% one celebrity's key (a hot-key problem no amount of total capacity fixes). After the totals,
+    always ask how the load is distributed.
+
+    Interviewers do not grade arithmetic precision. They grade whether you estimate when it
+    matters, round sensibly, state assumptions, and let the result change the design: "3 TB fits on
+    one node, so I will not shard for storage; I may need replicas for reads."
+  key_points:
+    - "A day is about 10^5 seconds: 1 M/day is about 12/s, 1 B/day about 12k/s."
+    - "Design for peak, usually 2 to 3x average and more for events."
+    - "Estimate QPS, storage, bandwidth and hot-set size; each points to a different component."
+    - "Check units and compare against known systems to catch order-of-magnitude errors."
+    - "After totals, ask about skew: hot sets and hot keys drive real designs."
+  concepts: [back-of-the-envelope, qps-estimation, storage-estimation, peak-to-average-ratio]

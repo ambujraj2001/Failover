@@ -1,0 +1,106 @@
+- slug: what-interviewers-look-for
+  day: 25
+  title: What interviewers look for at E4, E5 and E6
+  minutes: 10
+  summary: "The signals a system design interviewer is scoring, and how the same question is answered differently by a mid-level, senior and staff engineer."
+  plain: |
+    A system design interview is not a test of whether you know the "right" architecture. There usually is none. The interviewer is watching *how* you think: do you find out what is actually needed, make sensible choices, explain why, and notice what could go wrong?
+
+    Most companies score roughly the same four areas:
+    - **Problem navigation**: asking the right questions, pinning down requirements and scale before drawing boxes.
+    - **Solution design**: a working end-to-end design with sensible components and data model.
+    - **Technical depth**: going deep on the hardest part — the part where the problem is actually hard.
+    - **Communication**: explaining clearly, structuring the time, responding well to hints.
+
+    Levels differ in who is driving. Many companies use E-levels (Meta's naming; Google uses L-levels, often one number higher): **E4** is a mid-level engineer, **E5** senior, **E6** staff.
+
+    An analogy: three chefs asked to "cater a wedding". The junior chef cooks a good dish when told what the menu is. The senior chef asks about guest numbers and allergies first, then plans a menu that works and a kitchen that can produce it on time. The head chef does all that, and also points out that the venue has one oven, so the hot courses need staggering, and proposes a backup if the delivery van is late.
+
+    At E4 you are expected to produce a working design with some guidance. At E5 you drive the whole session and go deep on one or two areas without being led. At E6 you shape the problem, spot the one or two decisions that matter most, and weigh them against cost, operations and organisational reality.
+  deeper: |
+    ### The same question, three levels: "Design a URL shortener"
+    | Signal | E4 (mid) | E5 (senior) | E6 (staff) |
+    |---|---|---|---|
+    | Requirements | lists features when asked | states functional and non-functional requirements and scale up front (100M new URLs/day, 100:1 read:write, p99 < 50 ms) | also asks about abuse, analytics, custom domains, retention, and which matters most to the business |
+    | Design | API, DB, cache; works for the happy path | justifies key generation (counter + base62 vs hash), cache-aside with TTL, CDN for redirects | compares key schemes on collision, enumeration risk and coordination cost; plans multi-region reads |
+    | Depth | explains a component when prompted | picks the hard part unprompted (hot links, ID generation) and goes deep with numbers | identifies the failure that matters (cache stampede on a viral link, key-range exhaustion) and designs for it |
+    | Trade-offs | names them when asked | states them as choices with reasons | quantifies them and ties them to cost and operability |
+    | Driving | needs nudges to move on | runs the clock | runs the clock and adjusts scope to what the interviewer cares about |
+
+    ### What lowers a score at every level
+    - Jumping to boxes without requirements or numbers.
+    - Buzzword architecture: Kafka, Kubernetes and microservices with no reason given.
+    - Silent drawing. The interviewer cannot score what you do not say.
+    - Getting defensive when challenged instead of re-evaluating.
+    - Spending 20 minutes on the API and never reaching the hard part.
+
+    ### What raises it
+    - Back-of-the-envelope numbers that change a decision ("8k writes/s fits one Postgres primary, so no sharding yet").
+    - Explicit trade-offs with a choice ("I'll accept up to 5 s staleness on counts to keep writes cheap").
+    - Failure thinking: what breaks at 10x, what happens when a node dies, how you would know.
+    - Simplicity: the smallest design that meets the requirements, with a clear path to scale.
+
+    ### Calibrate your target
+    If you are interviewing for E5, an E4 answer delivered flawlessly is still an E4 signal. The difference is ownership: drive without prompting, choose the deep dive yourself, and close with risks and next steps. For E6, add breadth of judgement — operations, cost, migration path, and what you would *not* build.
+  key_points:
+    - "Interviewers score problem navigation, solution design, technical depth and communication, not a single correct answer."
+    - "E4 builds a working design with guidance; E5 drives and goes deep unprompted; E6 shapes the problem and weighs cost and operations."
+    - "Numbers that change a decision and explicit trade-offs are the strongest positive signals."
+    - "Silent drawing, buzzword components and never reaching the hard part are the most common score-killers."
+  concepts: [interview-rubric, leveling, requirements-gathering, trade-offs]
+
+- slug: the-45-minute-plan
+  day: 25
+  title: The 45-minute plan
+  minutes: 9
+  summary: "A minute-by-minute plan for a system design interview, so you always reach the deep dive and finish with time to discuss failures."
+  plain: |
+    Forty-five minutes feels long until you spend twenty of them on the API. The most common reason strong engineers fail system design interviews is not lack of knowledge; it is running out of time before reaching the interesting part.
+
+    Think of it like a cooking competition with a fixed clock. A sensible contestant spends a few minutes reading the brief and checking the pantry, sketches the menu, gets the main dish on the heat early, then spends the remaining time on the one dish that will impress the judges, leaving a few minutes to plate. Nobody wins by perfecting the garnish first.
+
+    A good plan has five phases:
+    1. **Requirements (about 5 minutes)**: what must the system do, for whom, at what scale, and what matters most — speed, consistency, cost?
+    2. **Estimation and API (about 5 minutes)**: rough numbers for traffic and storage, and the handful of main operations.
+    3. **High-level design (about 10 minutes)**: the boxes and arrows for the main flows, plus the data model. Get something end to end on the board.
+    4. **Deep dive (about 15–20 minutes)**: the one or two hardest parts, explored properly.
+    5. **Wrap-up (about 5 minutes)**: bottlenecks, failure cases, monitoring, what you would do next.
+
+    Say the plan out loud at the start ("I'll spend a few minutes on requirements, sketch a design, then go deep on the feed generation"). It shows you are in control and lets the interviewer steer early if they want something different. Glance at the clock at each phase change.
+  deeper: |
+    ### The plan, with exit criteria
+    | Minutes | Phase | Done when |
+    |---|---|---|
+    | 0–5 | Requirements | 3–5 functional requirements, 3–4 non-functional (scale, latency, availability, consistency), explicit out-of-scope list |
+    | 5–10 | Estimation + API | peak QPS, storage per year, read:write ratio; 3–5 endpoints or events with key fields |
+    | 10–20 | High-level design | every functional requirement traced through the diagram; data model with primary keys and the main access pattern |
+    | 20–38 | Deep dive | 1–2 hard parts designed in detail with numbers and alternatives |
+    | 38–45 | Wrap-up | bottleneck at 10x, failure of each stateful component, metrics and alerts, one or two extensions |
+
+    Interviews with intros often leave only 35–40 usable minutes. Compress requirements and estimation to 6–7 minutes combined, not the deep dive.
+
+    ### Choosing the deep dive
+    Pick where the problem is hard, not where you are comfortable:
+    - News feed: fan-out strategy and celebrity accounts.
+    - Chat: delivery guarantees, ordering, presence at scale.
+    - Payments: idempotency, ledger, reconciliation.
+    - Top-K: windowed aggregation and hot keys.
+    - Uber: location ingestion rate and matching without double booking.
+
+    Offer a choice: "The two interesting parts are fan-out and ranking; I'd go deep on fan-out unless you prefer ranking." That shows judgement and hands the interviewer the steering wheel at the right moment.
+
+    ### Time traps
+    - **Over-scoping requirements**: listing 12 features. Choose the core 3 and say the rest are out of scope.
+    - **Estimation rabbit holes**: precision beyond one significant figure wastes minutes. Round aggressively.
+    - **API bikeshedding**: names and status codes matter less than the shape of the main calls.
+    - **Re-drawing**: evolve one diagram; do not start over.
+    - **Ignoring hints**: if the interviewer asks "what about a celebrity with 50M followers?", that is the deep dive they want. Switch.
+
+    ### The wrap-up script
+    "At 10x, the first thing to break is X because Y; I'd fix it with Z. If the cache cluster dies, reads fall to the database at N qps, which it cannot hold, so we need request coalescing and a warm standby. I'd alert on p99 and error rate per endpoint, and on queue lag." Thirty seconds, three signals: scale, failure, observability.
+  key_points:
+    - "Budget roughly 5 min requirements, 5 estimation and API, 10 high-level design, 15–20 deep dive, 5 wrap-up."
+    - "State the plan aloud at the start and check the clock at each phase change."
+    - "Choose the deep dive where the problem is hard, and offer the interviewer a choice of two."
+    - "Close with what breaks at 10x, how each stateful component fails, and what you would monitor."
+  concepts: [interview-time-management, deep-dive, requirements-gathering, interview-rubric]

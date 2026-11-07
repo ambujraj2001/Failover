@@ -1,0 +1,177 @@
+slug: the-scraper-flood
+kind: lab
+title: The scraper flood
+difficulty: medium
+day: 12
+summary: Price-comparison bots hammer the uncacheable search endpoint and starve real shoppers. Rate-limit per client at a level that stops bots without touching customers.
+topics: [rate-limiting, abuse-prevention, api-protection, load-shedding]
+company_tags: [Amazon, Cloudflare, Instacart]
+estimated_minutes: 25
+incident: "SEV-2 · 55% of /search requests failing · 8,000 req/s from 300 IPs · API CPU 250%"
+
+brief_beginner: |
+  You run **Shelfwise**, an online grocery store. Real shoppers send about **2,000 requests per
+  second**. Most of them read product pages, which you already keep in Redis, so they are cheap.
+
+  This morning a few hundred machines started scraping your prices: they request search results
+  for every product, over and over, around **8,000 extra requests per second**. Search results
+  depend on the exact query, so the cache cannot help; every bot request runs on your API and hits
+  PostgreSQL. Your servers are now spending most of their time answering robots, and more than
+  half of your real customers get errors.
+
+  Bots and people look different: a person clicks a few times per second at most; a scraper
+  sends hundreds of requests per second from the same address. **Rate limiting** means the load
+  balancer counts requests per client and rejects the ones over a limit (with HTTP **429 Too Many
+  Requests**) before they ever reach your API.
+
+  The catch is choosing the limit. Too high and the bots still get through. Too low and you
+  block real shoppers who happen to click quickly, or share an office network.
+
+  **Your job:** keep real shoppers fast and error-free while the scrapers are running, and on a
+  normal day too.
+
+brief_expert: |
+  Legitimate load: 2,000 rps, 90% reads (80% cacheable, Redis hit ratio ~98%), PostgreSQL medium
+  at ~46%, API (4 × large) at ~51%. A bot wave adds 8,000 rps of uncacheable reads for 40 s,
+  which drives API CPU to ~250% and PostgreSQL past saturation. Bot traffic is not counted in
+  the error rate, but it consumes capacity.
+
+  Absorbing it is not an option within budget (it would take ~4× the API fleet plus a database
+  two sizes up). Enable per-client rate limiting at the load balancer and pick the threshold:
+  10, 50 or 200 req/s. The trade-off is false positives (legitimate clients over the limit) vs
+  leakage (bot traffic under it). The SLO applies on attack days and on normal days.
+
+glossary:
+  - term: Rate limiting
+    meaning: Capping how many requests one client (IP, API key, user) may send per second. Extra requests are rejected early.
+  - term: HTTP 429
+    meaning: The "Too Many Requests" status code a rate limiter returns. Well-behaved clients slow down when they see it.
+  - term: Scraper
+    meaning: A bot that downloads your pages automatically, often to copy prices or content.
+  - term: False positive
+    meaning: A real user wrongly treated as abusive and blocked. The hidden cost of a limit that is too tight.
+
+requirements:
+  - During the scraper wave, p99 under 70 ms and errors under 4%
+  - On a normal day, error rate under 0.5% (real shoppers must not be throttled)
+  - Stay within $1.20/hr (no buying your way out)
+
+budget: 1.2
+palette: [load_balancer, app_server, cache, database]
+
+starter:
+  nodes:
+    - {id: users, type: users, label: Shoppers + bots, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, config: {rate_limit: false}, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Shelfwise API, config: {size: large, instances: 4}, position: {x: 480, y: 160}}
+    - {id: redis, type: cache, label: Redis, config: {memory_gb: "4", ttl_s: 600}, position: {x: 720, y: 40}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: medium}, position: {x: 720, y: 280}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: redis}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, label: Shoppers + bots, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, config: {rate_limit: true, rate_limit_rps: "50"}, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Shelfwise API, config: {size: large, instances: 4}, position: {x: 480, y: 160}}
+    - {id: redis, type: cache, label: Redis, config: {memory_gb: "4", ttl_s: 600}, position: {x: 720, y: 40}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: medium}, position: {x: 720, y: 280}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: redis}
+    - {source: api, target: db}
+
+tests:
+  - id: scrape
+    name: Scrapers arrive
+    summary: 2,000 req/s of shoppers, plus 8,000 req/s of bots for 40 s
+    scenario:
+      duration: 60
+      base_rps: 2000
+      read_ratio: 0.9
+      cacheable: 0.8
+      working_set_gb: 2
+      events: [{at: 15, type: bot_wave, ratio: 4, duration: 40, label: "Scrapers: +8,000 req/s of search requests from 300 IPs"}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 70}
+      - {metric: error_rate, op: lte, value: 4}
+  - id: normal-day
+    name: A normal Tuesday
+    summary: Only real shoppers, no bots
+    hidden: true
+    scenario:
+      duration: 60
+      base_rps: 2000
+      read_ratio: 0.9
+      cacheable: 0.8
+      working_set_gb: 2
+    assertions:
+      - {metric: error_rate, op: lte, value: 0.5}
+      - {metric: p99_ms, op: lte, value: 60}
+  - id: bigger-wave
+    name: The scrapers scale up
+    summary: 14,000 req/s of bots for 40 s
+    hidden: true
+    scenario:
+      duration: 60
+      base_rps: 2000
+      read_ratio: 0.9
+      cacheable: 0.8
+      working_set_gb: 2
+      events: [{at: 10, type: bot_wave, ratio: 7, duration: 40}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 75}
+      - {metric: error_rate, op: lte, value: 1}
+
+hints:
+  - Run the test. The cache hit ratio is still ~98%, so the extra load is not coming from product pages. What kind of traffic is it, and which box sees it first?
+  - Scaling the API and database to absorb 8,000 bot requests per second does not fit the budget. Look at the Load Balancer's Protection settings.
+  - Turn on rate limiting. Then think about who else sends bursts — a family sharing one IP, a shopper clicking fast. 10 req/s blocks about 3% of real users; 200 req/s lets 20% of the bots through. Check the requirements for a normal day before you pick.
+
+editorial: |
+  ### Why it broke
+  Bot traffic skips the cache: search results are keyed by arbitrary queries, so every bot
+  request runs on the API and reaches PostgreSQL. At 8,000 extra req/s the API needs ~2.5× its
+  capacity (**peak 250% busy**) and PostgreSQL goes to 129%. The API's request queue overflows and
+  it starts refusing everyone, so **55% of real shoppers' requests fail** with p99 ~1.2 s, even
+  though their product pages are sitting in Redis.
+
+  ### The fix: per-client rate limiting at the edge
+  The load balancer counts requests per client and answers 429 above the limit, before any API
+  work happens:
+
+  | limit | bots blocked | real shoppers blocked | result |
+  |---|---|---|---|
+  | none | 0% | 0% | 55% errors, p99 1.2 s |
+  | 200 req/s | 80% | 0% | 1,600 bot req/s still reach the API: 23% errors, p99 2.1 s |
+  | **50 req/s** | **97%** | **0.2%** | **240 bot req/s get through: p99 52 ms, 0.2% errors** |
+  | 10 req/s | 99% | 3% | fast, but 3% of real shoppers get 429s, every day |
+
+  At 50 req/s the API sits at ~57% and PostgreSQL at ~62% during the attack: the remaining bot
+  traffic is noise.
+
+  ### The trap: the limit that looks best on attack day
+  10 req/s looks great while the bots are running: p99 46 ms, and the 3% errors fit under the
+  incident's 4% bar. But it blocks 3% of legitimate traffic **every day**: households and offices
+  behind one NAT address, a shopper paging quickly through results, a mobile app prefetching. The
+  hidden "normal Tuesday" test runs without bots and requires < 0.5% errors; 10 req/s fails it with
+  3%. The other hidden test raises the wave to 14,000 req/s: at 200 req/s, 2,800 bot req/s leak
+  through and the API saturates again. A rate limit is a classifier: tune it on *normal* traffic
+  first, then confirm it stops the attack.
+
+  ### Alternatives and why not
+  - **Scale to absorb**: ~4× the API fleet and a database two sizes up to serve robots. Out of
+    budget, and the bots can always add machines faster than you can.
+  - **Cache search results**: the long tail of queries has almost no reuse; scrapers vary
+    parameters precisely to defeat caches.
+  - **Block IP ranges by hand**: works for an hour. Rate limits (plus bot scoring, CAPTCHAs on
+    suspicious sessions, authenticated API keys with quotas) are the durable layer.
+
+  ### Interview takeaway
+  Protect expensive, uncacheable endpoints with rate limits enforced as early as possible
+  (edge/LB), keyed per client, sized from the real-user distribution (p99.9 of legitimate
+  per-client rates plus headroom), and returning 429 with Retry-After.

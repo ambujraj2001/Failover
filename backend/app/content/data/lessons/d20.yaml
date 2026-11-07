@@ -1,0 +1,101 @@
+- slug: authentication-and-authorization
+  day: 20
+  title: Authentication, authorization and secrets
+  minutes: 11
+  summary: "Who you are versus what you may do, how sessions and tokens carry that across services, and how to keep secrets out of code."
+  plain: |
+    **Authentication (AuthN)** answers "who are you?" — proving identity with a password, a passkey or a code from your phone. **Authorization (AuthZ)** answers "what are you allowed to do?" — may this user delete this document?
+
+    A hotel is the classic picture. At check-in the front desk checks your passport: that is authentication. They hand you a key card that opens your room, the gym and the lift to your floor, but not other guests' rooms: that is authorization. The key card is a **token** — something you carry so you do not have to show your passport at every door — and it expires at checkout.
+
+    On the web there are two common kinds of token. A **session** is a random ID stored in a cookie; the server looks it up in a database to find who you are. A **JWT** (JSON Web Token) is a signed bundle of facts ("user 42, role editor, expires 10:15") that any service can verify with a key, without a database lookup. JWTs are fast to check but hard to cancel before they expire, so they are kept short-lived and paired with a longer-lived **refresh token** that can be revoked.
+
+    **OAuth 2.0** lets you grant one app limited access to your data in another ("let this printing site read my photos") without sharing your password. **OpenID Connect** adds login on top of it ("Sign in with Google").
+
+    **Secrets** — database passwords, API keys, signing keys — never belong in source code. They live in a secrets manager, are fetched at runtime, and are rotated regularly.
+  deeper: |
+    ### Sessions vs JWTs
+    | | Opaque session | JWT access token |
+    |---|---|---|
+    | Validation | lookup in Redis/DB (~1 ms) | signature check, no network |
+    | Revocation | delete the row, instant | wait for expiry, or keep a denylist |
+    | Size | 32 bytes | 500 B – 2 KB in every request |
+    | Best for | first-party web apps | service-to-service, many APIs, mobile |
+
+    Typical lifetimes: access token 5–15 minutes, refresh token days to weeks with **rotation** (each use issues a new one; reuse of an old one signals theft and revokes the family). Store browser tokens in `HttpOnly; Secure; SameSite` cookies, not `localStorage`, to blunt XSS theft.
+
+    ### Passwords
+    Hash with argon2id, scrypt or bcrypt (cost ~10–12), tuned so one hash takes roughly 50–250 ms. Never a fast hash like SHA-256 alone: a GPU tries billions of those per second. Offer passkeys (WebAuthn) and TOTP; they kill phishing and credential stuffing.
+
+    ### Authorization models
+    - **RBAC**: users get roles, roles get permissions. Simple; explodes when permissions depend on the resource.
+    - **ABAC**: policies over attributes (`user.dept == doc.dept && time < 18:00`). Flexible, harder to audit. Policy engines: OPA, Cedar.
+    - **ReBAC**: permissions follow relationships ("editor of the folder that contains this doc"). Google Zanzibar, SpiceDB, OpenFGA. Right for sharing models like Drive.
+
+    Enforce authorization at the service that owns the data, not only at the gateway. The gateway authenticates; the resource service authorizes. Insecure direct object reference (changing `/invoices/123` to `/invoices/124`) is still the most common real-world hole.
+
+    ### Secrets management
+    - Secrets manager (Vault, AWS Secrets Manager) with per-service identity, short-lived dynamic credentials, audit logs.
+    - **Envelope encryption**: data encrypted with a data key; the data key encrypted by a master key in a KMS/HSM that never leaves it. Rotating the master key means re-wrapping small data keys, not re-encrypting terabytes.
+    - Service-to-service: mTLS with automatically rotated certificates (SPIFFE, service mesh).
+
+    ### What interviewers probe
+    How you revoke a stolen JWT, where authorization is enforced, how signing keys rotate (publish multiple keys via JWKS with a `kid`), and what happens if the auth service is down (cached public keys keep validation working; logins fail).
+  key_points:
+    - "Authentication proves identity; authorization decides access, and must be enforced by the service that owns the data."
+    - "Sessions revoke instantly but need a lookup; JWTs verify locally but need short lifetimes plus rotating refresh tokens."
+    - "Hash passwords with argon2id or bcrypt, and prefer passkeys; never a bare fast hash."
+    - "Keep secrets in a manager, use envelope encryption with a KMS, and rotate keys and certificates automatically."
+  concepts: [authentication, authorization, jwt, oauth2, envelope-encryption]
+
+- slug: defending-against-abuse
+  day: 20
+  title: Defending against abuse
+  minutes: 10
+  summary: "How scrapers, credential stuffers and floods differ, and the layered defences that stop them without blocking real users."
+  plain: |
+    **Abuse** is traffic that is technically valid but harmful: bots scraping every product page, attackers trying leaked passwords against your login, fake sign-ups, or a flood meant to knock you offline (a **denial-of-service** attack, or **DDoS** when it comes from many machines at once).
+
+    Think of a nightclub. A bouncer at the door turns away obvious trouble. A guest list limits how many friends one person can bring. Inside, staff watch for someone ordering forty drinks a minute. No single measure stops everyone, but together they keep the room usable for real guests. Defending a website works the same way: several cheap layers, each catching a different kind of bad actor.
+
+    The layers, from the outside in:
+    - **Network edge**: a CDN or DDoS-protection service absorbs huge floods before they reach you.
+    - **WAF** (web application firewall): blocks known attack patterns and bad IP addresses.
+    - **Rate limiting**: caps how many requests one client may send per second or minute.
+    - **Bot detection**: looks at behaviour — how fast, how regular, which browser features are present — to tell scripts from people.
+    - **Challenges**: a CAPTCHA or a small proof-of-work puzzle, shown only when something looks suspicious.
+    - **Business rules**: limits on sign-ups per phone number, or new accounts not being allowed to send payments for a day.
+
+    The goal is never zero bots; it is making abuse expensive while keeping the cost for real users close to zero. Every defence has a **false positive** rate — real users wrongly blocked — and that number matters as much as how many bots you stop.
+  deeper: |
+    ### Know the attack you are fighting
+    | Attack | Signal | Primary defence |
+    |---|---|---|
+    | Volumetric L3/L4 flood (Tbps) | packet rate, SYN floods | provider scrubbing, anycast absorption |
+    | L7 flood (valid HTTP) | rps per IP/ASN, uniform paths | rate limiting, challenge, cache everything cacheable |
+    | Scraping | sequential IDs, no assets fetched, datacenter ASNs | per-client quotas, behavioural scoring, auth walls |
+    | Credential stuffing | many usernames from few IPs, high failure ratio | per-account and per-IP limits, breached-password checks, MFA |
+    | Fake accounts / spam | burst sign-ups, disposable emails | phone/email verification, new-account restrictions |
+
+    ### Rate limits and their trade-off
+    Limits by IP alone fail against residential proxy networks (millions of IPs) and punish shared NATs (a university behind one IP). Layer keys: API key or user id where authenticated, IP plus device fingerprint where not, ASN for broad brakes.
+
+    The simulator models exactly this trade-off on the load balancer: a strict limit (10 rps per client) blocks 99% of bot traffic but also 3% of legitimate users; 50 rps blocks 97% of bots and 0.2% of users; 200 rps blocks only 80% of bots and no users. Bots that get through still consume app and database capacity even though their failures do not count against your error rate — which is why loose limits can still take you down.
+
+    ### Make abuse expensive
+    - Push cost onto the client: proof-of-work or CAPTCHA only on risky requests, so 99% of users never see it.
+    - Make scraped data less useful: require auth for deep pagination, cap page size, return opaque cursors instead of sequential IDs.
+    - Cache aggressively: an L7 flood against cached pages hits the CDN, not your origin.
+    - Shadow-ban or tarpit instead of hard-blocking, so attackers cannot quickly learn your thresholds.
+
+    ### Metrics to watch
+    Bot share of traffic, login failure ratio (normal is low single-digit %; stuffing pushes it above 50%), challenge solve rate, and support tickets from blocked users as the false-positive alarm.
+
+    ### What interviewers probe
+    "How do you rate limit across 50 gateway instances?" (shared counters in Redis, or local limits at limit/N with some slack). "How do you avoid locking out a real user under a stuffing attack?" (limit per IP and per account separately, and step up to MFA instead of locking).
+  key_points:
+    - "Abuse is defended in layers: edge scrubbing, WAF, rate limits, behavioural bot detection, challenges and business rules."
+    - "Match the defence to the attack; volumetric floods, scraping and credential stuffing have different signals."
+    - "Stricter rate limits block more bots but also more real users; tune with false positives in view."
+    - "Bots that pass still consume capacity, so cache what you can and challenge only risky traffic."
+  concepts: [rate-limiting, ddos-mitigation, bot-detection, credential-stuffing, web-application-firewall]

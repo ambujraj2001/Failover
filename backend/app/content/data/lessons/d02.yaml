@@ -1,0 +1,158 @@
+- slug: life-of-a-request
+  day: 2
+  title: The life of a request
+  minutes: 10
+  summary: Follow one HTTPS request from the browser to your server and back, and see where the milliseconds go before your code even runs.
+  plain: |
+    When you type `shrt.ly/abc123` and press Enter, several things happen before the server does
+    any real work. Think of sending a letter to a company you have never written to.
+
+    1. **Find the address (DNS).** Your browser knows the name `shrt.ly` but computers route by
+       numbers called **IP addresses**. The **Domain Name System** is the internet's phone book: it
+       turns the name into an address like `203.0.113.10`. Answers are remembered (cached) for a
+       while, so the second lookup is instant.
+    2. **Open a line (TCP).** **TCP** is the protocol that gives you a reliable, ordered
+       connection. Opening one takes a short back-and-forth called a **handshake**.
+    3. **Agree on a secret (TLS).** **TLS** is the "S" in HTTPS. Browser and server prove who they
+       are and agree on encryption keys, so nobody in between can read or change the traffic.
+    4. **Ask the question (HTTP).** Now the browser sends the actual request: `GET /abc123`. The
+       server runs your code, maybe asks a database, and replies, here with "go to this long URL".
+
+    Every back-and-forth across the network is called a **round trip**. Within one city a round
+    trip takes a few milliseconds; from London to New York it takes about 80. Steps 2, 3 and 4 each
+    cost at least one round trip, so a distant user can wait a quarter of a second before your
+    server has even started.
+
+    That is why the next lessons are about getting closer to users and reusing connections: the
+    fastest round trip is the one you never make.
+  deeper: |
+    ### Where the time goes on a cold connection
+    Assume an 80 ms round-trip time (RTT), London to us-east:
+
+    ```
+    DNS lookup (resolver cache miss)   ~20-100 ms   (0 if cached)
+    TCP handshake (SYN, SYN-ACK)        1 RTT  =  80 ms
+    TLS 1.3 handshake                   1 RTT  =  80 ms   (TLS 1.2: 2 RTT)
+    HTTP request -> first byte          1 RTT  =  80 ms + server time
+    -------------------------------------------------------------
+    time to first byte                  ~260-340 ms + server time
+    ```
+
+    On a warm, kept-alive connection the same request costs 1 RTT plus server time. The handshake
+    tax is paid per connection, not per request, which is why reuse matters more than raw
+    bandwidth for API traffic.
+
+    ### Levers
+    | Lever | Saves | Caveat |
+    |---|---|---|
+    | HTTP keep-alive / connection pools | TCP + TLS per request | idle connections hold memory and file descriptors |
+    | HTTP/2 | many requests multiplexed on one connection | TCP head-of-line blocking on packet loss |
+    | HTTP/3 (QUIC over UDP) | combined transport + TLS in 1 RTT, 0-RTT on resume | 0-RTT data is replayable, so only idempotent requests |
+    | TLS session resumption | full handshake on reconnect | ticket key rotation must be managed |
+    | Terminate TLS at an edge near the user | handshake RTT drops to ~10 ms | edge to origin still crosses the ocean, over a warm pool |
+
+    ### DNS as an operational tool
+    DNS TTLs trade agility for load and latency. A 300 s TTL means a DNS-based failover takes up to
+    5 minutes to reach most clients, and some resolvers and JVMs ignore low TTLs entirely. DNS
+    load balancing (multiple A records, GeoDNS, latency-based routing) is coarse: it cannot see
+    server health at sub-second resolution, which is why a load balancer sits behind it.
+
+    ### Inside the data centre
+    The same costs apply between your own services. A service-to-database call without pooling
+    pays a TCP and auth handshake each time; PostgreSQL also forks a backend process per connection
+    (several MB each). Every internal hop adds ~0.5 ms RTT plus serialisation, so a request that
+    crosses six services sequentially has spent ~5 ms just moving bytes.
+
+    ### What interviewers probe
+    "What happens when you type a URL" is a warm-up that separates people who can name the RTTs
+    from people who list acronyms. Be ready to say which steps a CDN or edge TLS removes, and why
+    HTTP/2 helps a page with 80 assets but not a single slow API call.
+  key_points:
+    - "A cold HTTPS request pays DNS, a TCP handshake (1 RTT), TLS 1.3 (1 RTT) and the request itself (1 RTT) before any server work."
+    - "RTT is set by distance: ~0.5 ms in a data centre, ~70 to 90 ms across a continent or ocean."
+    - "Connection reuse (keep-alive, pools, HTTP/2) removes handshakes; edge termination shortens them."
+    - "DNS TTLs make DNS-based failover slow and coarse; health-aware load balancers handle fast failover."
+  concepts: [dns-resolution, tls-handshake, round-trip-time, connection-reuse, http2-and-http3]
+
+- slug: load-balancers-and-cdns
+  day: 2
+  title: Load balancers and CDNs
+  minutes: 10
+  summary: A load balancer spreads requests across many servers and routes around dead ones; a CDN answers static requests from a location near the user so your servers never see them.
+  plain: |
+    Picture a busy supermarket. One checkout lane cannot handle Saturday, so the shop opens ten.
+    Someone at the front points each shopper to a lane that is open and not too busy. If a cashier
+    goes on break, that person stops sending shoppers there. That person is a **load balancer**.
+
+    A load balancer (LB) sits in front of your **app servers** (the machines running your code).
+    Every request goes to the LB first, and it forwards the request to one of the servers. It also
+    runs **health checks**: every few seconds it asks each server "are you alive?". A server that
+    does not answer is taken out of rotation until it recovers.
+
+    Now picture the same shop selling bottled water. Instead of everyone queueing at checkout for
+    water, the shop puts a fridge with water near the entrance of every neighbourhood. That is a
+    **CDN**, a **Content Delivery Network**: a company with servers in hundreds of cities that keep
+    copies of your files close to your users.
+
+    Most of a web page is **static content**: images, JavaScript, stylesheets, fonts. These are
+    the same for everyone and change rarely. A CDN stores a copy at the **edge** (a server near the
+    user) and answers in a few milliseconds, without bothering your servers at all.
+
+    **Dynamic content** is different: "show me *my* inbox" depends on who is asking and must come
+    from your app servers. The CDN passes those requests through.
+
+    Together they solve a common problem: your servers are overloaded, but most of what they are
+    doing is handing out the same logo a million times.
+  deeper: |
+    ### Load balancer layers
+    | | L4 (transport) | L7 (application) |
+    |---|---|---|
+    | Sees | IPs, ports, TCP/UDP | HTTP method, path, headers, cookies |
+    | Can do | very high throughput, TLS passthrough | path routing, header-based canary, retries, rate limits, TLS termination |
+    | Examples | AWS NLB, IPVS, Maglev | AWS ALB, Envoy, NGINX, HAProxy |
+
+    ### Balancing algorithms
+    - **Round robin / weighted**: fine when requests cost about the same.
+    - **Least outstanding requests**: better with variable request cost; reacts to a slow instance.
+    - **Power of two choices**: pick two at random, send to the less loaded. Near-optimal, cheap,
+      no global state.
+    - **Consistent hashing** on a key: when you want affinity (a cache shard, a WebSocket room).
+
+    Sticky sessions (cookie affinity) are a smell for stateless HTTP: they unbalance load and lose
+    user state when an instance dies. Move session state to Redis or a signed token instead.
+
+    ### Health checks
+    Active checks (probe `/healthz` every 1 to 5 s, eject after N failures) plus passive checks
+    (eject on observed 5xx or timeouts). The simulator stops routing to a dead instance after 3 s.
+    Keep `/healthz` shallow: if it checks the database, a database blip ejects every instance at
+    once and turns a partial outage into a total one.
+
+    ### CDN mechanics
+    The CDN caches by URL (plus any headers in the cache key) according to `Cache-Control`:
+
+    ```
+    Cache-Control: public, max-age=31536000, immutable    # /app.3f9a1c.js
+    Cache-Control: public, s-maxage=60, stale-while-revalidate=30   # semi-dynamic HTML
+    Cache-Control: private, no-store                      # per-user data
+    ```
+
+    Fingerprint asset filenames so you can cache them for a year and still deploy instantly.
+    Typical static hit ratios are 90 to 99%; the simulator serves 95% of static at the edge in about
+    6 ms. With a 60% static share at 10k rps, that removes 5,700 rps from your origin.
+
+    ### Failure modes
+    - Cache key includes a cookie or query string you did not intend: hit ratio collapses to zero.
+    - Caching a personalised response as `public`: one user's data served to others.
+    - Purge storms and cold edges after a deploy that renames every asset.
+    - The LB itself as a single point of failure: managed LBs are multi-AZ; self-run ones need a
+      pair with a floating IP or anycast.
+
+    Interviewers expect you to put a CDN in front of anything with static or cacheable public
+    content, and to explain how health checks interact with deploys and partial failures.
+  key_points:
+    - "A load balancer spreads traffic across instances and uses health checks to stop routing to dead ones."
+    - "L4 balances connections; L7 understands HTTP and can route, retry, rate limit and terminate TLS."
+    - "Prefer least-outstanding-requests or power-of-two-choices over plain round robin when request cost varies."
+    - "A CDN serves static and cacheable content from the edge, often removing most of your origin traffic."
+    - "Fingerprinted filenames plus long max-age give you both high hit ratios and instant deploys."
+  concepts: [load-balancing, health-checks, l4-vs-l7-load-balancing, cdn, cache-control-headers]

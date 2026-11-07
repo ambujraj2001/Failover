@@ -1,0 +1,257 @@
+slug: design-chat-app
+kind: problem
+title: Design a chat app
+difficulty: medium
+day: 14
+summary: Design WhatsApp-style 1:1 and group messaging. Sends are a write firehose, history reads are cacheable, and servers die mid-conversation.
+topics: [chat, websockets, message-queue, fan-out, ordering, caching, health-checks]
+company_tags: [Meta, WhatsApp, Slack, Discord, Microsoft, Amazon, Uber]
+estimated_minutes: 50
+incident: "Launch review · 50M DAU · 40B messages/day at maturity · design due Friday"
+
+brief_beginner: |
+  You are building **Natter**, a messaging app. People send messages to one friend (**1:1 chat**)
+  or to a group of up to 500 people. When you open a chat, the app loads the most recent messages
+  (the **history**). Messages must arrive in order, must never disappear, and should show
+  "delivered" and "read" ticks.
+
+  Think of a post office that never closes. Every message is a letter that must be logged,
+  sorted and delivered to every person in the chat, including people who are asleep (offline)
+  and will collect their mail later.
+
+  At peak you handle **4,000 requests per second**. Unlike most apps, a large share of them are
+  **sends** (40%), not reads. Today the chat servers write every message straight into one
+  database and wait for it to finish before replying. The database cannot keep up, so sending
+  feels slow and some messages fail.
+
+  Some words you will need. A **message queue** is a durable waiting line: the server drops the
+  message in, gets an instant "got it", and background **workers** take messages out and do the
+  slow work (saving, delivering to each group member). **Sharding** splits one big database into
+  several smaller ones, each holding a slice of the conversations. A **health check** is the load
+  balancer regularly asking each server "are you alive?" and skipping the ones that do not answer.
+
+  **Your job:** design the backend so sends are acknowledged fast and never lost, history loads
+  quickly, and the service keeps working when a server crashes or traffic bursts. Then write a
+  design note covering the parts a database diagram cannot show: connections, ordering and delivery.
+
+brief_expert: |
+  **Functional:** 1:1 and group chat (≤500 members), message history with pagination, delivery and
+  read receipts, online presence, offline delivery via push notification. Media upload is out of
+  scope.
+
+  **Non-functional:** send ack p99 < 150 ms, no message loss once acked, per-conversation ordering,
+  history load p99 < 150 ms, 99.95% availability.
+
+  **Scale:** 50M DAU × ~40 messages/day ≈ 2B messages/day ≈ 23k/s average. This exercise models one
+  regional cell at peak: **4k rps, 40% sends, 60% history/sync reads**; ~85% of reads are recent
+  history (cacheable), the rest are deep scroll-back. Storage: 2B × ~200 B ≈ 400 GB/day before
+  replication.
+
+  The starter writes synchronously to one PostgreSQL. Decouple the send path (durable log, workers
+  for persistence and fan-out), cache recent history, and size the message store for the write rate.
+  Expect instance failures and bursts in the hidden tests.
+
+glossary:
+  - term: WebSocket
+    meaning: A connection that stays open between the phone and the server, so the server can push new messages instantly instead of the phone asking "anything new?" every few seconds.
+  - term: Message queue
+    meaning: A durable waiting line (Kafka, SQS). Producers add messages and get an instant acknowledgement; workers process them at their own pace.
+  - term: Fan-out
+    meaning: Turning one sent message into one delivery per recipient. A message to a 500-person group fans out to 499 deliveries.
+  - term: Sharding
+    meaning: Splitting data across several independent databases by a key, such as conversation ID, so each one handles a slice of the traffic.
+  - term: Health check
+    meaning: The load balancer probes each server every few seconds and stops sending traffic to any that fail to answer.
+
+requirements:
+  - p99 latency under 150 ms at 4,000 req/s (40% sends)
+  - Error rate under 0.5%
+  - Queue lag under 5 s (messages are persisted within seconds)
+  - No lost messages, even when a server dies or traffic bursts
+  - Stay within $3.10/hr
+
+budget: 3.1
+palette: [load_balancer, app_server, database, cache, queue, worker]
+
+starter:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, config: {health_checks: false}, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Chat API, config: {size: large, instances: 6}, position: {x: 480, y: 160}}
+    - {id: db, type: database, label: Messages DB, config: {size: large, indexes: "id, conversation_id"}, position: {x: 720, y: 160}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, config: {health_checks: true}, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Chat API, config: {size: large, instances: 9}, position: {x: 480, y: 160}}
+    - {id: redis, type: cache, label: Recent history, config: {memory_gb: "16", ttl_s: 3600, stampede_protection: true}, position: {x: 720, y: 0}}
+    - {id: queue, type: queue, label: Message log, config: {partitions: 4}, position: {x: 720, y: 320}}
+    - {id: workers, type: worker, label: Persist + fan-out, config: {size: large, instances: 3}, position: {x: 960, y: 320}}
+    - {id: db, type: database, label: Messages DB, config: {size: medium, indexes: "id, conversation_id", shards: 3, shard_key: hash_user}, position: {x: 1200, y: 160}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: redis}
+    - {source: api, target: db}
+    - {source: api, target: queue}
+    - {source: queue, target: workers}
+    - {source: workers, target: db}
+
+tests:
+  - id: evening-peak
+    name: Evening peak
+    summary: 4,000 req/s, 40% message sends, 60% history reads
+    scenario:
+      base_rps: 4000
+      read_ratio: 0.6
+      cacheable: 0.85
+      working_set_gb: 10
+      hot_key_share: 0.05
+      query_column: conversation_id
+    assertions:
+      - {metric: p99_ms, op: lte, value: 150}
+      - {metric: error_rate, op: lte, value: 0.5}
+      - {metric: queue_lag_s, op: lte, value: 5}
+  - id: server-crash
+    name: Two chat servers crash
+    summary: Two API instances die at t=20s and do not come back
+    hidden: true
+    scenario:
+      base_rps: 4000
+      read_ratio: 0.6
+      cacheable: 0.85
+      working_set_gb: 10
+      hot_key_share: 0.05
+      query_column: conversation_id
+      events: [{at: 20, type: kill_app_instance, count: 2}]
+    assertions:
+      - {metric: error_rate, op: lte, value: 2.0}
+      - {metric: p99_ms, op: lte, value: 200}
+  - id: midnight-burst
+    name: Happy New Year burst
+    summary: Traffic jumps 60% for 20 seconds at midnight
+    hidden: true
+    scenario:
+      base_rps: 4000
+      read_ratio: 0.6
+      cacheable: 0.85
+      working_set_gb: 10
+      hot_key_share: 0.05
+      query_column: conversation_id
+      spikes: [{at: 20, duration: 20, multiplier: 1.6, ramp: 3}]
+    assertions:
+      - {metric: error_rate, op: lte, value: 1.0}
+      - {metric: queue_lag_s, op: lte, value: 8}
+      - {metric: write_loss_rate, op: lte, value: 0}
+
+hints:
+  - Run the visible test and read the database load. 1,600 sends per second at 1.5 units each is more write work than any single PostgreSQL in the palette can absorb while also serving reads, and the API waits on every one of those writes.
+  - Split the send path from the read path. App → Queue → Workers → Database acknowledges a send in milliseconds and persists it in the background. Then give the database enough write capacity (shards keyed by conversation) so the workers never fall behind, and cache recent history in Redis.
+  - The hidden tests kill API instances and burst traffic. Check what the load balancer does with a dead instance, and keep enough spare API capacity that losing two instances, or a 60% surge, does not push the tier past ~90%.
+
+design_prompt: |
+  Answer in writing. Be specific about protocols, keys and failure handling.
+
+  1. **Connections and API.** How do clients connect (WebSocket, long polling, SSE) and why? Define
+     the send-message call and its acknowledgement, the history call with pagination, and the
+     events the server pushes. How does the system know which gateway server a recipient is
+     connected to?
+  2. **Data model.** Give the schema for messages, conversations and membership, the partition (shard)
+     key and the sort key. How do you serve "last 50 messages in this chat" and "all chats with
+     unread messages for this user" efficiently?
+  3. **Ordering and IDs.** How do you guarantee per-conversation ordering when senders are on
+     different servers and clocks drift? How do you generate message IDs, and how does the client
+     de-duplicate a message it retried after a timeout?
+  4. **Delivery semantics.** Walk through the life of one message from send to "read" tick,
+     including an offline recipient. Where is it durably stored before you ack the sender? Is
+     delivery at-least-once or exactly-once from the user's point of view, and how?
+  5. **Group fan-out.** For a 500-member group, do you fan out on write (one inbox entry per
+     member) or on read (one copy per conversation)? What changes for very large channels?
+  6. **Failure.** A gateway server holding 100k WebSocket connections dies. What happens to those
+     clients and to messages in flight, and how do they resynchronise without gaps or duplicates?
+
+editorial: |
+  ### 1. Requirements
+  * **Functional:** 1:1 and group send, history, receipts, presence, offline push.
+  * **Non-functional:** low send latency, **zero loss after ack**, per-conversation ordering,
+    high availability. Global ordering across conversations is not required: say so explicitly.
+
+  ### 2. Estimation
+  | quantity | value |
+  |---|---|
+  | messages | 50M DAU × 40 = 2B/day ≈ 23k/s avg, ~60k/s peak globally |
+  | modelled cell | 4k rps: 1,600 sends/s, 2,400 history reads/s |
+  | storage | 2B × 200 B ≈ 400 GB/day, ~150 TB/year before replication |
+  | connections | ~10M concurrent sockets globally → ~200 gateway hosts at 50k each |
+  | hot history | last day of active chats ≈ 10 GB in this cell |
+
+  ### 3. High-level design
+  ```
+  Clients ⇄ WebSocket gateways (LB, health checks)
+     send   → Chat API → Message log (Kafka, partitioned by conversation_id) → ack client
+                          └→ Workers: persist to Messages DB (sharded by conversation_id)
+                                      fan out to recipients' gateways / push service
+     history → Chat API → Redis (recent pages) → Messages DB on miss
+  ```
+
+  ### 4. Why the starter fails
+  1,600 sends/s × 1.5 units = 2,400 units of write work, plus 2,400 reads/s, on one large node
+  (3,500/s). The database queues, the API's threads block waiting on it, and both reads and sends
+  time out. A bigger box does not fix it: writes cannot be spread over replicas.
+
+  ### 5. The fix, with numbers
+  * **Queue the send path.** Appending to a partitioned log takes ~2 ms; the client gets its ack
+    once the message is durable in the log. 3 large workers drain ~2,300 msgs/s against 1,600
+    arriving (70% busy).
+  * **Shard the store by `conversation_id`.** 3 medium shards: ~800 write units each plus a share of
+    the history misses: ~65% busy. Keying by conversation keeps one chat's messages together, so
+    history is a single-shard range scan and ordering is local to a shard.
+  * **Cache recent history.** 16 GB covers the 10 GB hot set: ~98% of recent-history reads hit,
+    leaving only deep scroll-back (~15% of reads) and misses for the database.
+  * **API tier:** 2,400 read units + 2,080 send units ≈ 4,500 units on 9 large instances = 50%.
+
+  ### 6. Deep dives
+  **Ordering.** Use a per-conversation sequence number assigned by the single owner of that
+  conversation's log partition (Kafka partition by `conversation_id`), not wall-clock time. Message
+  IDs can be Snowflake-style (time + node + counter) for global uniqueness, while `seq` gives the
+  display order. Clients send a `client_msg_id` so retries are de-duplicated server-side.
+
+  **Delivery.** At-least-once internally (log + idempotent consumers), effectively-once to the
+  user (dedupe on `client_msg_id`). Each device tracks its last acked `seq` per conversation; on
+  reconnect it asks "everything after seq N", which closes gaps after any failure.
+
+  **Presence and routing.** A session store (Redis) maps `user_id → gateway_id`, written on
+  connect, expired by heartbeat. Workers look up the recipient's gateway and push; if offline,
+  hand off to APNs/FCM.
+
+  **Groups.** For small groups (≤500), store one copy per conversation and fan out *notifications*,
+  not copies. Per-user inbox rows (fan-out on write) make "unread chats" cheap but multiply writes
+  by group size; large broadcast channels must use fan-out on read.
+
+  ### 7. What the hidden tests probe
+  * **Two servers crash:** without health checks, 2 of every 9 requests go to a dead instance for
+    the rest of the run (~15% errors). With them, errors are confined to the ~3 s detection window,
+    and the remaining 7 instances run ~65% busy. Six instances would pass the visible test and
+    overload here.
+  * **New Year burst (1.6×):** the queue absorbs the send spike; workers fall slightly behind and
+    catch up after. The API runs ~80% busy at the top. Synchronous writes collapse.
+
+  ### 8. Common mistakes
+  * Acknowledging a send before it is durable anywhere (lost on crash), or only after every
+    recipient has received it (slow and fragile).
+  * Ordering by server timestamp across machines.
+  * Sharding by `user_id` for messages: a conversation's history is then split across shards.
+  * Forgetting offline users and multi-device sync.
+
+  ### 9. What good answers look like
+  * **E4:** WebSockets, queue for sends, sharded message store, cache recent history, receipts.
+  * **E5:** per-conversation sequence numbers, idempotent sends via client IDs, resync from last seq,
+    presence via heartbeats and a session registry, explicit fan-out choice with numbers.
+  * **E6:** gateway failure and reconnect storms (jittered backoff), hot groups and broadcast
+    channels, multi-region (home region per conversation), end-to-end encryption implications
+    (server cannot read content, so search and moderation change), storage tiering for old history.

@@ -1,0 +1,248 @@
+slug: design-uber
+kind: problem
+title: Design Uber
+difficulty: hard
+day: 23
+summary: Ride matching on a stream of driver location updates. Buffer the writes, shard the geo index so hot cells cannot sink one shard, cache nearby lookups, and survive losing the database primary.
+topics: [geospatial-indexing, geohash, quadtree, matching, sharding, hot-keys, message-queue, failover, consistency]
+company_tags: [Uber, Lyft, DoorDash, Grab, Instacart]
+estimated_minutes: 50
+incident: "Design review · 5M drivers online at peak · city launch in 3 weeks"
+
+brief_beginner: |
+  When you open a ride app, you see little cars moving on the map, and when you tap "request" the
+  app finds you a nearby driver within seconds. Behind that are two streams of traffic:
+
+  - **Drivers report where they are** every few seconds. This is the bulk of all traffic, and it is
+    all *writes*: "driver 42 is now here".
+  - **Riders ask "who is near me?"** That is a *geo lookup*: find drivers within a few hundred metres
+    of a point on the map.
+
+  To answer "who is near me" quickly, the map is cut into small tiles called **cells** (for example
+  with a **geohash**, a short code like `u4pru` that names one tile). Drivers are filed under the
+  cell they are in, so a lookup only checks a few neighbouring cells instead of every driver on
+  Earth.
+
+  The catch: cells are not equally busy. When a concert ends, one cell around the stadium suddenly
+  holds thousands of riders and drivers. That cell is a **hot cell**, the map version of a hot key.
+  If the data is split across several databases by cell, the database holding the stadium gets
+  crushed while the others are idle.
+
+  Today all location updates and lookups go to one large PostgreSQL database. Even the biggest one
+  cannot keep up with the location writes.
+
+  **Your job:** take location updates in without overloading storage, split the data so a hot cell
+  does not sink one machine, keep lookups fast, and keep working when the main database machine
+  dies. Then explain how drivers and riders are actually matched.
+
+brief_expert: |
+  **Functional:** drivers send location every 4 s while online; riders see nearby drivers and
+  request a ride; the system matches a rider to one available driver, the driver accepts, and both
+  see each other's live position until pickup.
+
+  **Non-functional:** 5M drivers online at peak → ~1.25M location writes/s globally; ~300k nearby
+  queries/s; ~20k ride requests/s at peak. Match within ~5 s, nearby-driver p99 under 200 ms. A
+  driver must never be assigned to two riders at once. Location data is ephemeral (minutes), trip
+  data is durable. Demand concentrates in hot cells (airports, stadiums, downtown at 2 am).
+
+  **Graded part:** one city cluster at 8,000 req/s with light handlers (`app_work` 0.5): 75%
+  location updates (writes), 25% nearby lookups (60% cacheable for a few seconds, ~2 GB hot set),
+  and the hottest cell draws 50% of keyed traffic. One hidden test kills the database primary.
+  Keep the API tier as sized.
+
+glossary:
+  - term: Geohash
+    meaning: A way to turn a latitude/longitude into a short string. Nearby points share a prefix, and each extra character makes the cell smaller (6 characters ≈ 1.2 km × 0.6 km).
+  - term: Quadtree
+    meaning: A map index that splits a square into four smaller squares, again and again, but only where there are many points. Busy areas get small cells, empty areas stay large.
+  - term: Hot cell
+    meaning: A map cell with far more drivers and riders than the rest, such as an airport or a stadium after a game.
+  - term: Shard key
+    meaning: The rule that decides which database machine a row lives on. A bad key sends most traffic to one machine.
+  - term: Failover
+    meaning: Promoting a replica to be the new primary when the primary dies, so writes can continue after a short pause.
+
+requirements:
+  - "Normal evening: p99 under 80 ms, error rate under 0.5%, location processing lag under 5 s"
+  - Survive a stadium emptying and the loss of the database primary (hidden tests)
+  - Stay within $6.00/hr (the API tier stays at 8 large instances)
+
+budget: 6.0
+palette: [load_balancer, app_server, database, cache, queue, worker]
+
+starter:
+  nodes:
+    - {id: users, type: users, label: Riders & drivers, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Dispatch API, config: {size: large, instances: 8}, position: {x: 480, y: 160}}
+    - {id: db, type: database, label: Location DB, config: {size: xlarge, indexes: "id, geohash"}, position: {x: 720, y: 160}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, label: Riders & drivers, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Dispatch API, config: {size: large, instances: 8}, position: {x: 480, y: 160}}
+    - {id: redis, type: cache, label: Nearby cache, config: {memory_gb: "4", ttl_s: 5, stampede_protection: true}, position: {x: 720, y: 20}}
+    - {id: queue, type: queue, label: Location stream, config: {partitions: 4}, position: {x: 720, y: 300}}
+    - {id: workers, type: worker, label: Location indexers, config: {size: large, instances: 5}, position: {x: 960, y: 300}}
+    - {id: db, type: database, label: Location DB, config: {size: large, replicas: 1, failover: true, shards: 4, shard_key: hash_split_hot, indexes: "id, geohash"}, position: {x: 1200, y: 160}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: redis}
+    - {source: api, target: db}
+    - {source: api, target: queue}
+    - {source: queue, target: workers}
+    - {source: workers, target: db}
+
+tests:
+  - id: normal
+    name: A busy Friday evening
+    summary: 8,000 req/s, 75% location updates, the hottest cell draws half the lookups
+    scenario: {base_rps: 8000, read_ratio: 0.25, cacheable: 0.6, hot_key_share: 0.5, working_set_gb: 2, app_work: 0.5, query_column: geohash}
+    assertions:
+      - {metric: p99_ms, op: lte, value: 80}
+      - {metric: error_rate, op: lte, value: 0.5}
+      - {metric: queue_lag_s, op: lte, value: 5}
+  - id: stadium
+    name: The stadium empties
+    summary: Traffic rises 40% for 25 seconds and one cell takes 75% of keyed traffic
+    hidden: true
+    scenario:
+      base_rps: 8000
+      read_ratio: 0.25
+      cacheable: 0.6
+      hot_key_share: 0.75
+      working_set_gb: 2
+      app_work: 0.5
+      query_column: geohash
+      spikes: [{at: 15, duration: 25, multiplier: 1.4, ramp: 4}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 200}
+      - {metric: error_rate, op: lte, value: 0.5}
+      - {metric: queue_lag_s, op: lte, value: 5}
+  - id: primary-down
+    name: Database primary dies
+    summary: The primary crashes at t=20 s during normal load
+    hidden: true
+    scenario:
+      base_rps: 8000
+      read_ratio: 0.25
+      cacheable: 0.6
+      hot_key_share: 0.5
+      working_set_gb: 2
+      app_work: 0.5
+      query_column: geohash
+      events: [{at: 20, type: kill_db_primary}]
+    assertions:
+      - {metric: error_rate, op: lte, value: 0.5}
+      - {metric: queue_lag_s, op: lte, value: 11}
+      - {metric: write_loss_rate, op: lte, value: 0}
+
+hints:
+  - >-
+    Do the write math first. 6,000 location updates/s at 1.5 units each is 9,000 units, more than an
+    extra-large primary (8,000) can do on its own, before a single lookup. Vertical scaling has run
+    out. Location updates are also fire-and-forget: the driver's phone does not need to wait for the
+    index to be updated.
+  - >-
+    Put updates on a queue drained by workers that keep up with the update rate, and spread the
+    index over several shards. Then think about which shard holds the stadium cell. With a plain hash
+    of the cell, half of all keyed traffic lands on one shard. Pick a shard key that splits hot cells.
+    A short-TTL cache in front of nearby lookups takes repeated queries for the same cell off the
+    shards.
+  - >-
+    The last hidden test kills the primary. With a queue, updates are not lost; they wait. But they
+    only resume if something becomes the new primary, and lookups only keep working if there is a
+    copy to read from meanwhile. Give each shard a replica and automatic failover, and keep enough
+    worker headroom to drain ~12 s of backlog afterwards.
+
+editorial: |
+  ### 1. Requirements (5 minutes)
+  Separate the three subsystems: **location ingestion** (huge, ephemeral writes), **nearby search**
+  (geo reads, latency-sensitive), and **matching / trip state** (low volume, must be correct). Ask:
+  update interval (4 s), match latency target (seconds), how far to search (expanding radius), and
+  whether surge pricing and ETA are in scope (mention, do not design).
+
+  ### 2. Estimation
+  - 5M online drivers ÷ 4 s ≈ **1.25M location writes/s**, ~100 B each → 125 MB/s ingest.
+  - Live state: 5M × ~200 B ≈ **1 GB**. The whole live index fits in memory; durability for
+    positions is optional (they are stale in 4 s anyway), so an in-memory geo index (Redis GEO,
+    custom service) sharded by region beats a disk database.
+  - Nearby queries ~300k/s; each touches ~9 cells (center + neighbours).
+  - Ride requests ~20k/s at peak; trips are durable rows in a transactional store.
+
+  ### 3. High-level design
+  ```
+  driver app → location gateway → Kafka (partition by city, cell) → indexers → geo index shards
+                                                               └→ trip tracking, ETA, analytics
+  rider app → API → nearby service → cache (cell → drivers, TTL ~2–5 s) → geo index shards
+  ride request → matcher (per city/region) → candidate drivers from geo index
+              → reserve driver (conditional write) → offer → accept → trip DB (durable)
+  ```
+
+  ### 4. Deep dives
+  - **Geohash vs quadtree vs H3.** Geohash is a fixed grid: simple prefix lookups, but cells near
+    boundaries need neighbour queries and density varies wildly. A quadtree adapts (split a cell when
+    it holds more than ~500 drivers), which keeps hot downtown cells small, at the cost of
+    rebalancing. Uber uses H3 (hexagons): uniform neighbour distances, good for ETA and pricing.
+    Any of these is acceptable if you explain neighbour search and density.
+  - **Matching.** The matcher pulls k nearest available drivers by ETA (not straight-line distance),
+    ranks them, and offers sequentially or in small batches. Batched matching every 1–2 s over a
+    region optimises globally (fewer bad assignments) at the cost of a little latency.
+  - **Hot cells.** Shard by region/city first (locality, legal isolation), then within a city split
+    hot cells: a finer resolution in dense cells, or replicate hot-cell reads and salt their writes.
+    The cache helps reads (thousands of riders at the stadium ask about the same cell), but not the
+    write side; that is why the shard key matters.
+  - **Consistency of driver state.** Position can be eventually consistent. Availability cannot: a
+    driver must not be assigned twice. Keep driver status (`AVAILABLE → RESERVED → ON_TRIP`) in a
+    strongly consistent store owned by one matcher per region, and reserve with a compare-and-set
+    (`UPDATE … WHERE status = 'AVAILABLE'`) or a short lease that expires if the driver never
+    responds. The geo index may briefly show a reserved driver; the reservation step is the source
+    of truth.
+
+  ### 5. What the hidden tests probe
+  - **Stadium empties.** 75% of keyed traffic in one cell. With a hash-of-cell key the hot shard
+    receives 75% + 25%/4 ≈ 81% of all writes and melts. With hot cells split, each shard gets a
+    quarter.
+  - **Primary dies.** Without a queue, ~12 s of location updates fail outright (15% errors). With a
+    queue but no failover, updates pile up forever and lag passes 30 s. With replicas and failover,
+    lookups continue on the replica, writes wait ~12 s in the queue, and five large workers clear the
+    backlog. Peak lag ≈ 72k queued ÷ 7,700/s ≈ 9 s.
+
+  ### 6. Common mistakes
+  - Storing live locations in the trip database and querying `ORDER BY distance` across all drivers.
+  - Sharding by driver id: every nearby query then fans out to every shard.
+  - Sharding by cell without addressing hot cells.
+  - Matching with a read-then-write race, so two riders get the same driver.
+  - Making every location update durable and synchronous.
+
+  ### 7. What good looks like
+  - **E4:** geohash cells, a location store separate from trips, a queue for updates, nearby search
+    over neighbouring cells, basic matching.
+  - **E5:** ingestion numbers, in-memory sharded geo index, hot-cell handling, ETA-based candidate
+    ranking, compare-and-set reservation, failover behaviour stated.
+  - **E6:** regional cells of the whole system (each city independent), batched global matching,
+    adaptive cell sizes, explicit consistency model per data type, degradation plan (stale positions
+    rather than no matches), and how to test dispatch under a simulated stadium release.
+
+design_prompt: |
+  Answer each in a few sentences or a short sketch. Use numbers where you can.
+
+  1. **APIs.** Define the driver location update, the rider's nearby-drivers query and the ride
+     request. Which are synchronous, which are fire-and-forget, and what does each return?
+  2. **Geo index.** Choose geohash, a quadtree or H3. Explain how a "drivers within 500 m" query
+     works including neighbouring cells, what precision you use, and where the index lives (memory
+     or disk) given 1.25M updates/s.
+  3. **Matching.** Walk through what happens from "request ride" to "driver accepted". How do you
+     rank candidates, and what happens if the first driver ignores the offer?
+  4. **Hot cells and sharding.** An airport cell holds 20x the drivers and riders of an average
+     cell. What is your shard key, and how do you keep one cell from overloading one shard on both
+     the write and the read side?
+  5. **Consistency of driver state.** How do you guarantee a driver is never assigned to two
+     riders, while keeping location updates cheap? What happens to in-flight matches if the store
+     holding driver status fails over?

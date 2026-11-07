@@ -1,0 +1,163 @@
+- slug: replication-lag
+  day: 8
+  title: Replication lag and read-your-writes
+  minutes: 10
+  summary: Asynchronous replicas trail the primary by milliseconds to seconds, which can make a user's own change appear to vanish, unless you route their reads carefully.
+  plain: |
+    You change your profile picture, the page reloads, and the old picture is still there. You
+    refresh again and the new one appears. Nothing was lost. You just met **replication lag**.
+
+    Recall the setup: writes go to the **primary** database, and reads go to **replicas** that
+    receive copies of each change. The question is *when* the replica gets the change.
+
+    - **Asynchronous replication**: the primary saves your change, tells you "done", and sends the
+      change to replicas afterwards. Fast, but for a short moment the replicas do not have it yet.
+      If your next request reads from a replica, you see the old data.
+    - **Synchronous replication**: the primary waits until at least one replica confirms it has
+      the change before telling you "done". No stale reads from that replica, but every write takes
+      longer, and if that replica is slow or down, writes slow down or stop.
+
+    Think of a shop with a main till and a display board. With asynchronous updates, the clerk
+    takes your order and updates the board when they get a moment. With synchronous updates, they
+    update the board before handing you the receipt.
+
+    The guarantee users care about most is **read-your-writes**: *I* should always see *my own*
+    changes immediately, even if other people see them a second later. That is usually achievable
+    without making everything synchronous. Common tricks:
+
+    - For a few seconds after a user writes, send that user's reads to the primary.
+    - Always read "my own profile" from the primary, and other people's profiles from replicas.
+
+    Strangers seeing your new picture one second late is fine. You not seeing it looks like a bug.
+  deeper: |
+    ### How much lag
+    Healthy async streaming replication in one region: typically under 10 to 100 ms. Under write
+    bursts, long transactions, replica I/O saturation or a vacuum storm: seconds to minutes.
+    Cross-region adds at least the RTT (70 to 150 ms). Lag is unbounded by design; you only bound it
+    by monitoring and ejecting slow replicas.
+
+    The simulator models async replicas as ~1% stale reads, rising when the primary is above 70%
+    busy, and sync replicas as +3 ms per write with no stale reads.
+
+    ### Replication modes
+    | Mode | Commit waits for | Write latency | Data loss on primary failure | Availability risk |
+    |---|---|---|---|---|
+    | Async | local WAL flush | lowest | last few ms to s of writes | none from replicas |
+    | Semi-sync (MySQL) / `synchronous_commit=remote_write` | one replica received | +1 RTT | ~none unless both fail | slow replica slows writes |
+    | Sync (`remote_apply`) | one replica applied | +1 RTT + apply | none | replica down blocks writes without quorum config |
+
+    PostgreSQL's `synchronous_standby_names = 'ANY 1 (r1, r2)'` waits for any one of two replicas,
+    so a single slow replica does not stall commits.
+
+    ### Read-your-writes techniques
+    1. **Primary pinning window**: after a write, set a cookie or session flag; route that user to
+       the primary for N seconds, where N exceeds p99 lag. Simple; adds primary load proportional to
+       write activity.
+    2. **Position tracking**: return the commit LSN (`pg_current_wal_lsn()`) to the client; on read,
+       pick a replica whose `pg_last_wal_replay_lsn()` is at or beyond it, else use the primary.
+       Precise; needs plumbing.
+    3. **Read own data from primary**: routes by ownership, not time. Works well when users mostly
+       read their own data (settings) or mostly others' (feeds).
+    4. **Write-through cache** of the user's own recent writes, overlaid on replica reads.
+
+    ### Related anomalies
+    - **Monotonic reads**: two consecutive reads hit different replicas, and the second is older
+      than the first: the comment appears, then disappears. Fix by pinning a session to one replica.
+    - **Consistent prefix**: seeing an answer before the question, when related writes replicate
+      through different partitions.
+
+    ### What interviewers probe
+    "A user updates their profile and sees the old one. Why, and what do you do?" They want lag
+    named, the trade-off between sync and async stated with a latency cost, and a targeted fix
+    (pinning or LSN routing) rather than "make everything synchronous" or "read everything from the
+    primary", which throws away the replicas you added for capacity.
+  key_points:
+    - "Async replicas lag by milliseconds normally and seconds or more under load; lag has no hard upper bound."
+    - "Synchronous replication removes stale reads and data loss at the cost of write latency and availability risk."
+    - "Read-your-writes is usually what users need: route a user's reads to the primary after they write, or track commit positions."
+    - "Monotonic reads break when consecutive reads hit different replicas; pin sessions to fix it."
+  concepts: [replication-lag, asynchronous-replication, synchronous-replication, read-your-writes, monotonic-reads]
+
+- slug: consistency-models
+  day: 8
+  title: Consistency models and CAP
+  minutes: 11
+  summary: Consistency models describe which values a read may return when data lives on several machines, and CAP says what you must give up when those machines cannot talk.
+  plain: |
+    When data lives on one machine, "what is the current value?" has one answer. Once you keep
+    copies on several machines, as with replicas or data centres in different countries, copies
+    can disagree for a while. A **consistency model** is a promise about what you may see.
+
+    Two ends of the range:
+
+    - **Strong consistency**: every read sees the most recent write, as if there were one copy.
+      Like a single shared whiteboard that everyone looks at.
+    - **Eventual consistency**: if writes stop, all copies will *eventually* agree, but a read
+      right now might return an older value. Like printed notices pinned in several rooms: when you
+      change the notice, it takes a while for someone to replace all of them.
+
+    In between sit useful promises like **read-your-writes** (you always see your own changes)
+    and **monotonic reads** (you never see time go backwards).
+
+    Now the famous one. The **CAP theorem** concerns a **network partition**: the network between
+    two groups of machines breaks, so they cannot talk, but both are still running and receiving
+    requests. During that partition each side must choose:
+
+    - **Consistency (C)**: refuse requests it cannot confirm are up to date, so nobody sees wrong
+      data, but some users get errors.
+    - **Availability (A)**: answer anyway with what it has, so everyone gets a response, but some
+      answers may be stale or conflict.
+
+    You cannot have both during a partition. A bank balance should choose consistency. A "likes"
+    counter should choose availability. Most real systems make that choice per feature.
+  deeper: |
+    ### A practical ladder
+    | Model | Guarantee | Typical source |
+    |---|---|---|
+    | Linearizable | real-time order, single-copy illusion | single leader read from leader; Spanner; etcd/ZooKeeper reads with quorum |
+    | Sequential | one global order, not tied to real time | some coordination services |
+    | Causal | if A could have caused B, everyone sees A before B | MongoDB causal sessions, COPS-style designs |
+    | Read-your-writes / monotonic reads | per-client guarantees | session routing, LSN tracking |
+    | Eventual | convergence when writes stop | async replicas, DNS, Dynamo-style stores at R=W=1 |
+
+    ### CAP, stated precisely
+    CAP's C is linearizability and A is "every non-failed node answers". The theorem only bites
+    during a partition, and partitions are not optional in a distributed system, so the real choice
+    is **CP or AP under partition**. Calling a system "CA" means it is not distributed, or it
+    pretends partitions never happen.
+
+    **PACELC** is more useful day to day: if **P**artitioned, choose **A** or **C**; **E**lse
+    (normal operation), choose **L**atency or **C**onsistency. Synchronous replication across
+    regions costs a cross-region RTT on every write even when nothing is broken. DynamoDB defaults
+    to PA/EL (eventually consistent reads are cheaper and faster); Spanner is PC/EC.
+
+    ### Quorums
+    Leaderless stores (Cassandra, Dynamo-style) with `N` replicas, write quorum `W` and read quorum
+    `R` guarantee that reads overlap the latest acknowledged write when `R + W > N`:
+
+    ```
+    N=3, W=2, R=2  -> overlap; tolerates 1 node down for both reads and writes
+    N=3, W=1, R=1  -> fastest, eventual; tolerates 2 down
+    N=3, W=3, R=1  -> fast reads, any node down blocks writes
+    ```
+    Quorum overlap is not linearizability: sloppy quorums, hinted handoff and last-write-wins clock
+    skew can still return stale or lost writes.
+
+    ### Choosing per feature
+    - Money movement, inventory decrement, uniqueness (usernames): strong, often a single leader
+      with transactions.
+    - Social counts, view counts, recommendations: eventual.
+    - User-facing edits: read-your-writes on top of eventual.
+
+    ### What interviewers probe
+    Whether you can apply CAP to a concrete feature ("during a partition, the checkout refuses
+    rather than oversells") instead of reciting it, know PACELC's latency trade-off in normal
+    operation, and can do quorum arithmetic. Saying "we use eventual consistency" without naming
+    what the user will observe is a red flag.
+  key_points:
+    - "Consistency models range from linearizable (single-copy illusion) to eventual (copies converge later)."
+    - "CAP: during a network partition a system must choose between consistency and availability."
+    - "PACELC adds the everyday trade-off: without a partition you still choose between latency and consistency."
+    - "Leaderless quorums need R + W > N for reads to overlap the latest acknowledged write."
+    - "Choose consistency per feature: money and uniqueness strong, counts eventual, user edits read-your-writes."
+  concepts: [strong-consistency, eventual-consistency, cap-theorem, pacelc-theorem, quorum-reads-and-writes]

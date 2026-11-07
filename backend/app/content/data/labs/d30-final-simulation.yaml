@@ -1,0 +1,231 @@
+slug: final-simulation
+kind: lab
+title: Final simulation
+difficulty: hard
+day: 30
+checkpoint: true
+summary: A stadium tour goes on sale and everything breaks at once. Turn a single-server ticketing site into a system that survives spikes, dead databases, cold caches, bots and a checkout rush.
+topics: [end-to-end-design, capacity-planning, failover, queues, rate-limiting, caching, cdn, autoscaling]
+company_tags: [Ticketmaster, Amazon, Google]
+estimated_minutes: 60
+incident: "SEV-1 · on-sale opened at 10:00 · 87% of requests failing · single API instance at 405% · fans cannot load the seat map"
+
+brief_beginner: |
+  You run **Gatehouse**, a ticketing site. Today at 10:00 tickets go on sale for a stadium tour.
+  Normally **5,000 requests per second** arrive: half are images and scripts, most of the rest
+  are fans browsing events and seat maps, and some are orders. When the sale opens, traffic
+  climbs to **2.5×** within seconds and stays there for most of a minute.
+
+  Your current system is the simplest thing that works on a quiet day: one big API server and
+  one database. On sale day it fails in the first second, and that is before anything else goes
+  wrong. Things *will* go wrong: during past sales the database primary crashed, the cache came
+  back empty, scalpers pointed bots at the site, and a wave of fans all clicked "buy" at once.
+
+  This is the capstone. Every tool from the last 29 days is on the palette: CDN, load balancer,
+  autoscaling, cache, replicas and failover, rate limiting, queues and workers. You do not need
+  the biggest version of each; you need the right ones, sized for the job, within a tight budget.
+
+  **Your job:** keep the sale fast and almost error-free through the opening spike *and* through
+  whatever breaks next.
+
+brief_expert: |
+  5,000 rps baseline: 50% static, dynamic 85/15 read/write, 90% of reads cacheable (3 GB hot set).
+  On-sale: 2.5× over 8 s, held 40 s (peak ~12,500 rps, ~940 orders/s). Starter: Users → one xlarge
+  API → PostgreSQL large. No redundancy anywhere.
+
+  Hidden tests combine the on-sale peak with: PostgreSQL primary death (plus two API instances
+  lost), a cache flush at peak, a 10,000 req/s bot wave, and a checkout rush (30% writes). SLO
+  throughout: p99 < 70–80 ms, errors < 0.3% (< 0.75% in the test where API instances die), no
+  lost orders, order backlog drained within ~30 s.
+
+  Design each layer for its failure: static at the edge, cacheable reads in Redis with stampede
+  protection, an app tier with N+2 headroom behind health-checked load balancing and a per-client
+  rate limit, orders accepted into a durable queue and drained by workers at a rate the primary
+  can take, and a replicated primary with automatic failover and RPO = 0. The budget leaves
+  little room for oversizing.
+
+glossary:
+  - term: Defense in depth
+    meaning: Several independent safeguards, so one failure (or one missing piece) does not take the whole system down.
+  - term: Blast radius
+    meaning: How much of the system a single failure affects. Good designs keep it small.
+  - term: Graceful degradation
+    meaning: Under stress, keep the core working (browse, buy) even if something non-essential is slower or briefly unavailable.
+  - term: SLO
+    meaning: Service level objective. The target you promise, e.g. "p99 under 70 ms and fewer than 0.3% errors".
+  - term: Capacity plan
+    meaning: Peak load per layer, plus headroom for failures, turned into a number of machines and a cost.
+
+requirements:
+  - Through the on-sale peak, p99 under 70 ms and errors under 0.3%
+  - "Survive whatever breaks next: a dead database primary, a cold cache, bots and a checkout rush"
+  - No lost orders; order backlog clears within about 30 seconds
+  - Stay within $3.40/hr
+
+budget: 3.4
+palette: [cdn, load_balancer, app_server, cache, database, queue, worker]
+
+starter:
+  nodes:
+    - {id: users, type: users, label: Fans, position: {x: 0, y: 160}}
+    - {id: api, type: app_server, label: Gatehouse API, config: {size: xlarge, instances: 1}, position: {x: 480, y: 160}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: large}, position: {x: 960, y: 160}}
+  edges:
+    - {source: users, target: api}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, label: Fans, position: {x: 0, y: 160}}
+    - {id: cdn, type: cdn, label: CDN, position: {x: 240, y: 160}}
+    - {id: lb, type: load_balancer, config: {health_checks: true, rate_limit: true, rate_limit_rps: "50"}, position: {x: 480, y: 160}}
+    - {id: api, type: app_server, label: Gatehouse API, config: {size: large, instances: 10, autoscaling: true, max_instances: 16}, position: {x: 720, y: 160}}
+    - {id: redis, type: cache, label: Redis, config: {memory_gb: "4", ttl_s: 300, stampede_protection: true}, position: {x: 960, y: 0}}
+    - {id: queue, type: queue, label: Order queue, config: {partitions: 2}, position: {x: 960, y: 320}}
+    - {id: workers, type: worker, label: Order workers, config: {size: medium, instances: 3}, position: {x: 1200, y: 320}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: large, replicas: 1, replication: sync, failover: true}, position: {x: 1440, y: 160}}
+  edges:
+    - {source: users, target: cdn}
+    - {source: cdn, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: redis}
+    - {source: api, target: db}
+    - {source: api, target: queue}
+    - {source: queue, target: workers}
+    - {source: workers, target: db}
+
+tests:
+  - id: on-sale
+    name: Tickets go on sale
+    summary: 5,000 req/s → 2.5× in 8 s, held for 40 s
+    scenario:
+      duration: 90
+      base_rps: 5000
+      read_ratio: 0.85
+      static_ratio: 0.5
+      cacheable: 0.9
+      working_set_gb: 3
+      spikes: [{at: 15, duration: 40, multiplier: 2.5, ramp: 8}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 70}
+      - {metric: error_rate, op: lte, value: 0.3}
+  - id: primary-dies
+    name: The database primary dies at peak
+    summary: PostgreSQL primary crashes at t=30s, two API instances at t=40s
+    hidden: true
+    scenario:
+      duration: 90
+      base_rps: 5000
+      read_ratio: 0.85
+      static_ratio: 0.5
+      cacheable: 0.9
+      working_set_gb: 3
+      spikes: [{at: 15, duration: 40, multiplier: 2.5, ramp: 8}]
+      events:
+        - {at: 30, type: kill_db_primary}
+        - {at: 40, type: kill_app_instance, count: 2}
+    assertions:
+      - {metric: p99_ms, op: lte, value: 80}
+      - {metric: error_rate, op: lte, value: 0.75}
+      - {metric: queue_lag_s, op: lte, value: 15}
+      - {metric: write_loss_rate, op: lte, value: 0}
+  - id: cold-cache
+    name: Redis comes back empty at peak
+    summary: Cache flush at t=30s, during the on-sale
+    hidden: true
+    scenario:
+      duration: 90
+      base_rps: 5000
+      read_ratio: 0.85
+      static_ratio: 0.5
+      cacheable: 0.9
+      working_set_gb: 3
+      spikes: [{at: 15, duration: 40, multiplier: 2.5, ramp: 8}]
+      events: [{at: 30, type: cache_flush}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 70}
+      - {metric: error_rate, op: lte, value: 0.3}
+  - id: scalper-bots
+    name: Scalpers unleash their bots
+    summary: +10,000 req/s of bot traffic for 40 s
+    hidden: true
+    scenario:
+      duration: 90
+      base_rps: 5000
+      read_ratio: 0.85
+      static_ratio: 0.5
+      cacheable: 0.9
+      working_set_gb: 3
+      spikes: [{at: 15, duration: 40, multiplier: 2.5, ramp: 8}]
+      events: [{at: 20, type: bot_wave, ratio: 2, duration: 40}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 70}
+      - {metric: error_rate, op: lte, value: 0.3}
+  - id: checkout-rush
+    name: Everyone clicks "buy" at once
+    summary: 30% of dynamic traffic is orders during the on-sale
+    hidden: true
+    scenario:
+      duration: 120
+      base_rps: 5000
+      read_ratio: 0.7
+      static_ratio: 0.5
+      cacheable: 0.9
+      working_set_gb: 3
+      spikes: [{at: 15, duration: 40, multiplier: 2.5, ramp: 8}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 75}
+      - {metric: error_rate, op: lte, value: 0.3}
+      - {metric: queue_lag_s, op: lte, value: 30}
+      - {metric: write_loss_rate, op: lte, value: 0}
+
+hints:
+  - "Start with the visible test and walk the request path one layer at a time: which requests could be served before they reach the API, and which reads could be served before they reach PostgreSQL?"
+  - "Then list what the hidden tests will break, one by one: the primary, the cache, the API fleet, bot traffic, a write surge. For each, name the component or setting that contains it. Sketch a capacity plan per layer at 2.5× and check it against the budget."
+  - "Users → CDN → LB (health checks, 50 req/s per-client limit) → ~10 large API instances with autoscaling → Redis (stampede protection) for reads, PostgreSQL large with a synchronous replica and failover, and orders through a queue to ~3 medium workers. Size the workers between the normal and peak order rates."
+
+editorial: |
+  ### Why it broke
+  One API instance, reached without a load balancer, serves the whole sale. At 2.5× it needs
+  four times its capacity (**peak 405% busy**) and **87% of requests fail** before anything else
+  goes wrong. Every hidden test then adds a failure the starter has no answer for: no
+  replica, no cache, no rate limit, no buffer for orders.
+
+  ### The reference design, layer by layer
+  ```
+  Fans → CDN → LB (health checks, 50 req/s/client) → API ×10 large (autoscale ≤16)
+                                                       ├─▶ Redis 4 GB (stampede protection)
+                                                       ├─▶ PostgreSQL large + sync replica (failover)
+                                                       └─▶ Order queue → 3 medium workers ─▶ PostgreSQL
+  ```
+  | failure | what contains it | result in the simulator |
+  |---|---|---|
+  | on-sale spike | CDN (static off the origin), 10 large API instances (66% at peak) | p99 53 ms, 0.1% errors (the rate limiter's false positives) |
+  | primary dies at peak | sync replica + failover (RPO 0); reads continue on the replica, orders wait in the queue during the 12 s gap | order lag peaks ~9 s, nothing lost |
+  | two API instances die | N+2 headroom (fleet peaks at 83%) + health checks; autoscaling refills | ~0.5% errors in the 3 s before health checks remove them, then nothing |
+  | Redis flushed at peak | stampede protection + replica sharing reads | p99 54 ms (vs ~310 ms without stampede protection) |
+  | 10,000 req/s of bots | per-client rate limit at the LB | 97% blocked; p99 55 ms |
+  | checkout rush (30% writes) | queue absorbs ~1,900 orders/s; workers drain ~1,150/s | lag peaks ~23 s, then drains; 0 lost |
+
+  Peak cost is about **$3.30/hr** (more API instances run while autoscaling covers the bot test).
+
+  ### The traps
+  - **No queue**: orders write straight to the primary. During the 12 s failover every order
+    fails (~2% errors in that test), and the checkout rush pushes p99 past 100 ms.
+  - **No failover**: the queue hides the dead primary from fans, but orders never land; lag keeps
+    growing (32 s and rising when the test ends).
+  - **Too few workers** (2 medium): the checkout rush backlog takes ~57 s to clear. **Too many**
+    would hand the burst straight to PostgreSQL, the lesson from day 10.
+  - **No stampede protection**: fine until the cache flushes at peak; then misses stampede the
+    database and p99 jumps to ~310 ms.
+  - **No rate limit**: bots take ~19% of real requests down with them.
+  - **Fewer API instances** (8): autoscaling is too slow for an 8 s ramp; p99 ~85 ms at peak.
+  - **No CDN**: the API has to serve every image; the extra instances push cost past the budget
+    (~$3.45–3.60/hr) and the tail past the SLO once anything else breaks.
+
+  ### Interview takeaway
+  The final answer is rarely one clever component. It is a chain of simple ones, each sized from
+  a capacity estimate and each matched to a specific failure: edge caching, read caching with
+  stampede control, stateless N+2 compute behind health checks, admission control, asynchronous
+  writes with bounded lag, and replicated storage with automatic failover. Say which failure each
+  box exists for, and what it costs.

@@ -1,0 +1,113 @@
+# Quick-reference sheet. Values are order-of-magnitude rules of thumb, not benchmarks.
+
+- title: Latency numbers
+  rows:
+    - {label: L1 cache reference, value: "~1 ns"}
+    - {label: Branch mispredict, value: "~3 ns"}
+    - {label: L2 cache reference, value: "~4 ns"}
+    - {label: Mutex lock/unlock, value: "~20 ns"}
+    - {label: Main memory (RAM) reference, value: "~100 ns", note: "About 100x L1"}
+    - {label: Compress 1 KB (fast codec), value: "~2 µs"}
+    - {label: Read 1 MB sequentially from RAM, value: "~10 µs"}
+    - {label: SSD random read (4 KB), value: "~100 µs", note: "NVMe can be 20-100 µs"}
+    - {label: Read 1 MB sequentially from SSD, value: "~200 µs-1 ms"}
+    - {label: Round trip within one datacenter, value: "~0.5 ms", note: "Same availability zone is often 0.1-0.3 ms; cross-AZ 1-2 ms"}
+    - {label: Redis GET over the network, value: "~0.5-1 ms", note: "Simulator uses 0.8 ms"}
+    - {label: Indexed Postgres point query, value: "~1-5 ms", note: "Unindexed scan on a large table: 100 ms to seconds"}
+    - {label: HDD seek, value: "~10 ms"}
+    - {label: Read 1 MB sequentially from HDD, value: "~5-20 ms"}
+    - {label: Object storage GET (first byte), value: "~20-50 ms", note: "Simulator uses 25 ms"}
+    - {label: Round trip, same continent, value: "~20-40 ms"}
+    - {label: Round trip, cross-continent (US-Europe), value: "~80-100 ms"}
+    - {label: Round trip, US-Asia or Europe-Australia, value: "~150-250 ms"}
+    - {label: TLS 1.3 handshake, value: "1 RTT (0 on resumption)", note: "TLS 1.2 needs 2 RTT; add TCP's 1 RTT"}
+    - {label: Human-perceived instant, value: "< 100 ms"}
+
+- title: Throughput rules of thumb
+  rows:
+    - {label: Postgres indexed point reads, value: "~1-2k QPS per core", note: "Simulator: 600 / 1.5k / 3.5k / 8k QPS per node for small / medium / large / xlarge"}
+    - {label: Postgres writes, value: "~1/2 to 1/3 of read throughput", note: "Simulator costs a write at 1.5 read units"}
+    - {label: Postgres connections, value: "A few hundred before degrading", note: "Use a pooler such as PgBouncer"}
+    - {label: Unindexed query cost, value: "10-1000x an indexed one", note: "Simulator charges 15x"}
+    - {label: Redis (single node), value: "~80-100k ops/s", note: "Single-threaded command execution; simulator uses 80k"}
+    - {label: Memcached (single node), value: "~200k+ ops/s", note: "Multi-threaded"}
+    - {label: Kafka partition, value: "~5-10 MB/s or ~5-10k msg/s", note: "Simulator uses 5k msg/s per partition; scale by adding partitions"}
+    - {label: Kafka broker, value: "~100k-1M msg/s", note: "Depends on message size, batching and replication"}
+    - {label: One app instance (typical web API), value: "~250-2,000 RPS", note: "Simulator: 250 / 500 / 1k / 2k RPS for small to xlarge"}
+    - {label: One load balancer, value: "~100k RPS+", note: "Managed LBs scale further"}
+    - {label: Nginx serving static files, value: "~10k-50k RPS per core"}
+    - {label: WebSocket connections per server, value: "~50k-1M", note: "Bounded by memory and file descriptors, not CPU"}
+    - {label: 1 Gbps network link, value: "~125 MB/s"}
+    - {label: 10 Gbps network link, value: "~1.25 GB/s"}
+
+- title: Availability
+  rows:
+    - {label: "99% (two nines)", value: "3.65 days/year", note: "7.3 h/month, 1.7 h/week"}
+    - {label: "99.5%", value: "1.83 days/year", note: "3.65 h/month"}
+    - {label: "99.9% (three nines)", value: "8.77 h/year", note: "43.8 min/month, 10.1 min/week"}
+    - {label: "99.95%", value: "4.38 h/year", note: "21.9 min/month"}
+    - {label: "99.99% (four nines)", value: "52.6 min/year", note: "4.4 min/month, 1 min/week"}
+    - {label: "99.999% (five nines)", value: "5.26 min/year", note: "26 s/month"}
+    - {label: Components in series, value: "A = A1 x A2 x ... x An", note: "Three 99.9% components in series: ~99.7%"}
+    - {label: Redundant components in parallel, value: "A = 1 - (1 - A1)(1 - A2)", note: "Two independent 99% replicas: 99.99%"}
+    - {label: Error budget, value: "1 - SLO", note: "99.9% over 30 days: 43 minutes of failure, or 0.1% of requests"}
+
+- title: Capacity formulas
+  rows:
+    - {label: Seconds per day, value: "86,400 (~10^5)", note: "Use 10^5 for mental math"}
+    - {label: Average QPS from DAU, value: "DAU x actions per user per day / 86,400", note: "100M DAU x 10 actions: ~12k QPS"}
+    - {label: Peak QPS, value: "Average QPS x peak factor", note: "2-3x for daily cycles; 10x+ for launches, sales and live events"}
+    - {label: Read vs write QPS, value: "Total QPS x read ratio, total x (1 - read ratio)", note: "Social and URL-shortener reads are often 10:1 to 100:1"}
+    - {label: Storage per year, value: "Writes/day x bytes per write x 365 x replication factor", note: "Add 20-50% for indexes and overhead"}
+    - {label: Bandwidth, value: "QPS x average response size", note: "10k QPS x 100 KB = 1 GB/s = 8 Gbps"}
+    - {label: Little's law, value: "In-flight = arrival rate x time in system (L = λW)", note: "2k RPS x 50 ms = 100 concurrent requests"}
+    - {label: Servers needed, value: "Peak QPS / per-server QPS at target utilisation, plus N+1", note: "Target 50-70% utilisation for headroom"}
+    - {label: Backend load behind a cache, value: "Read QPS x (1 - hit ratio)", note: "10k reads at 99% hits: 100 QPS reach the DB"}
+    - {label: Effective latency with a cache, value: "hit ratio x cache latency + miss ratio x (cache + DB latency)"}
+    - {label: Cache size for hot set, value: "Items x bytes per item x hot fraction", note: "Often the top 20% of keys serve 80% of reads"}
+    - {label: Queue drain time, value: "Backlog / (drain rate - arrival rate)", note: "Never drains if arrival rate >= drain rate"}
+    - {label: Shards needed, value: "max(peak write QPS / per-shard QPS, data size / per-shard storage)"}
+
+- title: Powers of two and units
+  rows:
+    - {label: "2^10", value: "1,024 (~1 thousand)", note: "KB"}
+    - {label: "2^20", value: "~1 million", note: "MB"}
+    - {label: "2^30", value: "~1 billion", note: "GB"}
+    - {label: "2^40", value: "~1 trillion", note: "TB"}
+    - {label: "2^50", value: "~1 quadrillion", note: "PB"}
+    - {label: "2^32", value: "~4.3 billion", note: "Range of a 32-bit unsigned ID"}
+    - {label: "2^64", value: "~1.8 x 10^19", note: "Range of a 64-bit ID"}
+    - {label: Character / ASCII, value: "1 byte", note: "UTF-8 non-Latin characters: 2-4 bytes"}
+    - {label: Integer / timestamp, value: "4-8 bytes"}
+    - {label: UUID, value: "16 bytes (36 as text)"}
+    - {label: Typical metadata row, value: "~100 B-1 KB"}
+    - {label: Image (compressed), value: "~100 KB-2 MB"}
+    - {label: 1 minute of 1080p video, value: "~50-100 MB", note: "Multiply by renditions for transcoded storage"}
+    - {label: Base62 code length, value: "62^7 ~ 3.5 trillion", note: "7 characters covers most URL shorteners"}
+
+- title: Consistency and replication
+  rows:
+    - {label: Quorum overlap, value: "W + R > N", note: "N=3, W=2, R=2 gives reads that see the latest acknowledged write"}
+    - {label: Write-optimised quorum, value: "W = 1, R = N", note: "Fast writes, slow reads"}
+    - {label: Read-optimised quorum, value: "W = N, R = 1", note: "Any replica failure blocks writes"}
+    - {label: Consensus fault tolerance, value: "2f + 1 nodes tolerate f failures", note: "3 nodes tolerate 1, 5 tolerate 2"}
+    - {label: Synchronous replication, value: "No acknowledged data loss on failover", note: "Adds a replica round trip to every write; a slow replica slows writes"}
+    - {label: Asynchronous replication, value: "Fast writes, stale reads, possible loss", note: "RPO equals replication lag at failure; simulator shows ~1% stale reads"}
+    - {label: Read-your-writes, value: "Read from primary briefly after a write", note: "Or wait until the replica has applied the write's log position"}
+    - {label: CAP, value: "Under partition: choose C or A"}
+    - {label: PACELC, value: "Else (no partition): choose latency or consistency"}
+    - {label: Cross-region sync write, value: "+1 cross-region RTT per write", note: "~80-200 ms; why most multi-region systems replicate asynchronously"}
+
+- title: Interview checklist
+  rows:
+    - {label: 1. Clarify requirements, value: "~5 min", note: "Functional scope, users, scale, latency, availability, consistency. Write them down."}
+    - {label: 2. Estimate, value: "~3-5 min", note: "QPS (average and peak), read/write ratio, storage, bandwidth. Only the numbers that change the design."}
+    - {label: 3. API and data model, value: "~5 min", note: "Core endpoints, entities, keys and access patterns."}
+    - {label: 4. High-level design, value: "~10 min", note: "Clients, LB, services, storage, cache, queues. Walk one request end to end."}
+    - {label: 5. Deep dives, value: "~15 min", note: "Bottlenecks, hot keys, consistency, failure modes. Let the interviewer steer."}
+    - {label: 6. Wrap up, value: "~3-5 min", note: "Trade-offs made, what breaks first at 10x, monitoring and next steps."}
+    - {label: Always state, value: "Trade-offs, not just choices", note: "'X instead of Y because Z; the cost is W.'"}
+    - {label: Check for, value: "Single points of failure", note: "Every tier redundant? What happens when each one dies?"}
+    - {label: Check for, value: "Hot spots", note: "Celebrity users, top-of-hour expiries, monotonic shard keys."}
+    - {label: Check for, value: "Retries and idempotency", note: "Every mutating call safe to retry?"}
+    - {label: Check for, value: "Observability", note: "Which metrics and alerts would tell you this is breaking?"}

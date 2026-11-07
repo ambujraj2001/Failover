@@ -1,0 +1,109 @@
+- slug: geospatial-indexing
+  day: 23
+  title: Geospatial indexing
+  minutes: 11
+  summary: "How to answer 'what is near me?' fast by turning two-dimensional locations into keys a normal index can search, with geohash, quadtrees, S2 and H3."
+  plain: |
+    "Find drivers within 2 km" sounds simple, but a normal database index sorts by one value at a time. Latitude and longitude are two values, and sorting by one does not keep nearby points together. Checking the distance to every driver in a city is far too slow when there are millions of them.
+
+    A **geospatial index** solves this by dividing the map into **cells** and giving each cell a key. Nearby points share cells, so "near me" becomes "look up my cell and its neighbours".
+
+    **Geohash** is the classic scheme. Split the world in half by longitude and write down 0 or 1 for which half you are in; then split by latitude; keep alternating. Every split doubles the precision. The bits are written as short strings like `gcpvj`. Longer strings mean smaller cells, and points that share a prefix are usually close. It is like postcodes: everyone whose postcode starts with "SW1" is in the same part of London.
+
+    A **quadtree** divides the map into four squares, then divides any square with too many points into four again. Busy city centres get tiny cells; empty ocean stays one huge cell. That keeps the number of points per cell roughly even.
+
+    Two widely used libraries refine these ideas. **S2** (from Google) projects the Earth onto a cube and numbers cells along a curve that keeps nearby cells numerically close. **H3** (from Uber) covers the Earth in hexagons; every hexagon's six neighbours are the same distance away, which makes "the ring of cells around me" clean to compute.
+  deeper: |
+    ### Geohash cell sizes (at the equator)
+    | Length | Cell size |
+    |---|---|
+    | 5 | ~4.9 km x 4.9 km |
+    | 6 | ~1.2 km x 0.6 km |
+    | 7 | ~153 m x 153 m |
+    | 8 | ~38 m x 19 m |
+
+    **Edge problem**: two points 10 m apart can sit on either side of a cell boundary and share no prefix. Always query the cell plus its 8 neighbours, then filter by exact distance (haversine). Cells also shrink in width towards the poles.
+
+    ### Choosing an index
+    | | Geohash | Quadtree | S2 | H3 |
+    |---|---|---|---|---|
+    | Storage | string/int prefix in any B-tree or sorted set | in-memory tree | 64-bit cell id | 64-bit cell id |
+    | Density adaptive | no | yes | via covering at mixed levels | no (fixed resolutions) |
+    | Neighbours | 8, uneven distances | tree walk | 4/8 | 6, equidistant |
+    | Used by | Redis GEO, Elasticsearch | many in-house systems | Google Maps, MongoDB 2dsphere | Uber, surge and analytics |
+
+    H3 has resolutions 0–15; resolution 7 hexagons average ~5 km², resolution 9 ~0.1 km² (a few city blocks). Redis `GEOADD`/`GEOSEARCH` stores a 52-bit geohash as the sorted-set score, so radius queries are range scans: sub-millisecond for thousands of points per cell.
+
+    ### The write problem
+    Moving objects dominate the load, not queries. 1M active drivers sending a location every 4 s is 250k writes/s. Keep the live index in memory (Redis or a custom service sharded by cell or city), and send the location stream to Kafka for history and analytics. Do not put live locations in a relational table with a GiST index and expect it to keep up with that write rate.
+
+    ### Sharding and hot cells
+    Shard by region or city, not by driver id, so a query touches one shard. Stadiums and airports create hot cells: split them to a finer resolution, or replicate the hot cell's data to several nodes for reads.
+
+    ### When not to bother
+    For a static, modest dataset (100k restaurants), PostGIS with a GiST index or a geohash column in Postgres is plenty; a custom quadtree service is over-engineering.
+
+    ### What interviewers probe
+    Cell size choice versus search radius, the boundary problem, how you handle a 4-second update rate, and why hexagons help when computing supply and demand per area.
+  key_points:
+    - "Geo-indexes map 2-D locations to cell keys so nearby points share keys and normal indexes can search them."
+    - "Geohash precision grows with string length; always search the neighbouring cells to fix the boundary problem."
+    - "Quadtrees adapt to density; S2 and H3 give 64-bit cell ids, with H3 hexagons having equidistant neighbours."
+    - "For moving objects, location writes dominate; keep the live index in memory and shard by geography."
+  concepts: [geohash, quadtree, s2-geometry, h3-index, geospatial-index]
+
+- slug: real-time-matching
+  day: 23
+  title: Real-time matching
+  minutes: 10
+  summary: "How a ride-hailing system pairs riders with drivers in seconds without double-booking anyone, and how it copes with surges in a few hot cells."
+  plain: |
+    **Matching** means pairing two sides of a market in real time: a rider and a driver, a diner and a courier. It has to be fast (a rider will not wait a minute for the app to think), fair enough, and it must never give the same driver to two riders.
+
+    Imagine a taxi rank dispatcher with a radio. A customer arrives; the dispatcher looks at a map of nearby free cabs, picks the best one, and radios it: "pickup at the station, do you accept?" The driver has fifteen seconds to say yes. If they decline or stay silent, the dispatcher offers the job to the next cab. While a cab is being asked, no other customer can be given that cab.
+
+    The software version has the same steps:
+    1. **Find candidates**: query the geospatial index for free drivers in the rider's cell and neighbouring cells.
+    2. **Rank them**: by estimated time to arrive (along real roads, not straight-line distance), rating, vehicle type.
+    3. **Reserve and offer**: mark the chosen driver as "offered" so nobody else can take them, then send the offer.
+    4. **Confirm or move on**: on accept, create the trip; on decline or timeout, release the driver and try the next.
+
+    Step 3 is a small **distributed lock**: a short **lease** on that driver that expires on its own if anything crashes.
+
+    **Hot cells** are places where demand suddenly exceeds supply — a concert ending, an airport at midnight. Systems respond with **surge pricing** (raising prices in that area to attract drivers and cool demand) and queues for pickups.
+  deeper: |
+    ### State machine per driver
+    ```
+    OFFLINE -> AVAILABLE -> OFFERED (lease 10–15 s) -> ON_TRIP -> AVAILABLE
+                    ^__________ decline / timeout _____|
+    ```
+    The transition `AVAILABLE -> OFFERED` must be atomic: a compare-and-set (`SET driver:42:state offered NX PX 15000` in Redis, or `UPDATE ... WHERE state = 'AVAILABLE'` in the DB). Whoever wins the CAS owns the offer. Trip creation uses the driver's offer id as an idempotency key so a double-tapped accept does not create two trips.
+
+    ### Greedy vs batched matching
+    - **Greedy**: match each request to the best available driver immediately. Lowest latency, globally suboptimal (gives rider A the driver rider B needed more).
+    - **Batched**: collect requests for 1–2 s per area, then solve an assignment problem (Hungarian algorithm or min-cost flow) minimising total ETA. Uber and Lyft both describe batched matching; it improves average pickup times at the cost of a short wait.
+
+    ### Sizing
+    Say 20M trips/day: ~230 trip requests/s average, ~1k/s at peak. Each request reads candidates from a few cells and runs ETA calls for maybe 10–20 drivers: 10–20k routing queries/s at peak. The location firehose (hundreds of thousands of writes/s) dwarfs the matching load, which is why location and matching are separate services.
+
+    ### Sharding by geography
+    Partition the matching service by city or by large cell groups so one shard sees all supply and demand for an area. Cross-boundary requests query the neighbouring shard. Ringpop (consistent hashing over a gossip membership) was Uber's early approach to owning cells per node.
+
+    ### Hot cells and surge
+    - Compute supply/demand ratio per H3 cell every 30–60 s from the location and request streams; price multipliers smooth over neighbouring cells to avoid sharp borders.
+    - A stadium cell can exceed one node; split it to finer resolution or put it on a dedicated node.
+    - Degrade gracefully: widen the search radius, offer scheduled pickups, queue riders at airports first-in-first-out.
+
+    ### Failure modes
+    - Driver app offline mid-offer: the lease expires, driver returns to the pool, no manual cleanup.
+    - Matching node dies: its in-flight offers expire; riders retry with the same request id.
+    - Stale locations: drop drivers whose last ping is older than ~15 s from candidate lists.
+
+    ### What interviewers probe
+    How you prevent double assignment, what happens on driver timeout, how you rank by ETA cheaply (precomputed road-graph partitions, cached ETAs), and how surge is computed per area.
+  key_points:
+    - "Matching is find candidates, rank by ETA, atomically reserve with a lease, then offer and confirm or move on."
+    - "The AVAILABLE to OFFERED transition must be a compare-and-set; idempotency keys prevent duplicate trips."
+    - "Batched matching over 1–2 s windows beats greedy on average pickup time at a small latency cost."
+    - "Shard by geography, separate the location firehose from matching, and handle hot cells with surge and finer cells."
+  concepts: [matching-engine, compare-and-set, lease, surge-pricing, h3-index]

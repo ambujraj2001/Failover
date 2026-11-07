@@ -1,0 +1,181 @@
+slug: primary-down-at-3am
+kind: lab
+title: Primary down at 3 am
+difficulty: medium
+day: 11
+summary: The only PostgreSQL node dies and takes the whole product with it. Add a standby that takes over by itself, and make sure the survivor can carry the load.
+topics: [failover, replication, redundancy, rto-rpo, high-availability]
+company_tags: [GitHub, Stripe, Shopify]
+estimated_minutes: 25
+incident: "SEV-1 · 100% of /api/* failing since 03:12 · PostgreSQL primary unreachable · no standby"
+
+brief_beginner: |
+  You run **Ledgerly**, an invoicing app for small businesses. About **1,100 requests per
+  second** reach your API; 90% of them read data (open an invoice, list customers) and 10% write
+  (send an invoice, record a payment). Everything lives in **one** PostgreSQL server.
+
+  At 03:12 that server's disk controller failed. The machine is gone. Every page that needs the
+  database (all of them) now returns an error, and they will keep doing so until someone wakes
+  up, restores a backup onto a new machine and points the app at it. That usually takes hours.
+
+  The fix is **redundancy**: keep a second copy of the database running all the time, kept up
+  to date by **replication** (every change on the main server, the *primary*, is copied to the
+  *replica*). If the primary dies, the replica is **promoted** to become the new primary. With
+  **automatic failover** that happens in seconds, with nobody awake.
+
+  Two numbers describe how good your recovery is:
+  - **RTO** (recovery time objective): how long you are down. Here, the business accepts about
+    a dozen seconds of failed writes.
+  - **RPO** (recovery point objective): how much recent data you can lose. For invoices and
+    payments the answer is *none*.
+
+  **Your job:** make the app survive the primary dying (and dying again), without losing a single
+  saved invoice.
+
+brief_expert: |
+  1,100 rps, 90/10 read/write, single PostgreSQL medium (~1,500 units/s) at ~77% busy. A
+  `kill_db_primary` event leaves it permanently down: reads and writes fail for the rest of the
+  run. Requirements: RTO ≈ one failover (~12 s of write errors), **RPO = 0**, p99 unaffected.
+
+  You need at least one replica with automatic failover. Then think past the first event:
+  async vs sync replication (lag means stale reads now and lost commits at promotion; sync costs
+  ~3 ms per write), how much capacity is left once a replica has been promoted (N+1 at peak),
+  and what happens if the promoted node is the next to fail. The budget is enough for a smart
+  topology, not for oversizing every node.
+
+glossary:
+  - term: Replica
+    meaning: A live copy of the database that receives every change from the primary and can serve reads.
+  - term: Failover
+    meaning: Promoting a replica to be the new primary when the old one dies. Automatic failover does it without a human.
+  - term: RTO
+    meaning: Recovery time objective. The longest outage the business accepts, e.g. "back within 15 seconds".
+  - term: RPO
+    meaning: Recovery point objective. How much recent data you may lose. RPO = 0 means no acknowledged write is ever lost.
+  - term: Synchronous replication
+    meaning: The primary waits for the replica to confirm a write before telling the app it succeeded. Slower writes, no lag.
+
+requirements:
+  - Survive the primary dying with error rate under 1.6% over the run (one ~12 s failover)
+  - RPO = 0 — no replication lag (stale reads at most 0.1%)
+  - p99 latency under 80 ms
+  - Stay within $1.15/hr
+
+budget: 1.15
+palette: [load_balancer, app_server, database]
+
+starter:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Ledgerly API, config: {size: medium, instances: 5}, position: {x: 480, y: 160}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: medium, indexes: "id, account_id"}, position: {x: 720, y: 160}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Ledgerly API, config: {size: medium, instances: 5}, position: {x: 480, y: 160}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: medium, indexes: "id, account_id", replicas: 2, replication: sync, failover: true}, position: {x: 720, y: 160}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: db}
+
+tests:
+  - id: primary-dies
+    name: The primary dies at 03:12
+    summary: 1,100 req/s; PostgreSQL primary crashes at t=30s
+    scenario:
+      duration: 90
+      base_rps: 1100
+      read_ratio: 0.9
+      query_column: account_id
+      events: [{at: 30, type: kill_db_primary, label: "Disk controller failure: PostgreSQL primary is gone"}]
+    assertions:
+      - {metric: error_rate, op: lte, value: 1.6}
+      - {metric: stale_read_rate, op: lte, value: 0.1}
+      - {metric: p99_ms, op: lte, value: 80}
+  - id: dies-at-peak
+    name: The primary dies during month-end billing
+    summary: Traffic is 40% higher when the primary crashes
+    hidden: true
+    scenario:
+      duration: 90
+      base_rps: 1100
+      read_ratio: 0.9
+      query_column: account_id
+      spikes: [{at: 20, duration: 50, multiplier: 1.4, ramp: 5}]
+      events: [{at: 35, type: kill_db_primary}]
+    assertions:
+      - {metric: error_rate, op: lte, value: 1.9}
+      - {metric: p99_ms, op: lte, value: 100}
+  - id: second-failure
+    name: The promoted replica dies too
+    summary: A second crash 50 s after the first one
+    hidden: true
+    scenario:
+      duration: 120
+      base_rps: 1100
+      read_ratio: 0.9
+      query_column: account_id
+      events:
+        - {at: 20, type: kill_db_primary}
+        - {at: 70, type: kill_db_primary, label: "The newly promoted primary crashed as well"}
+    assertions:
+      - {metric: error_rate, op: lte, value: 2.4}
+      - {metric: p99_ms, op: lte, value: 80}
+
+hints:
+  - Run the test and read the log after t=30. Is anything left that could answer a query, or take over writes?
+  - A second copy only helps if it is kept up to date and somebody (or something) promotes it. Look at the database's Replication settings, and at which replication mode guarantees no committed invoice is lost.
+  - Add read replicas, turn on automatic failover and use synchronous replication. Then count nodes after a failover — the promoted replica is no longer a replica. Will the survivors carry peak traffic, and survive a second crash?
+
+editorial: |
+  ### Why it broke
+  There was exactly one copy of the data. When the primary died at t=30 every read had nowhere
+  to go ("no primary and no replicas") and every write was rejected. For the remaining 60 seconds
+  of the test **100% of requests failed**, a 67% error rate overall, and in real life it would
+  stay that way until a human restored a backup. Single points of failure do not degrade; they
+  stop.
+
+  ### The fix: replicas + automatic failover + synchronous replication
+  ```
+  PostgreSQL primary ──sync──▶ replica 1
+                     └─sync──▶ replica 2
+  primary dies → health check fails → promote replica 1 (~12 s) → app reconnects
+  ```
+  - **During the outage** reads keep working: they are already spread over the replicas. Only
+    writes fail, for ~12 s. With 10% writes over a 90 s run that is **~1.3% errors** in total.
+  - **RTO** ≈ detection + promotion ≈ 12 s here. Real systems (Patroni, RDS Multi-AZ) land
+    between 10 and 60 s.
+  - **RPO**: with *asynchronous* replication the replica trails the primary slightly (the
+    simulator shows ~0.3–0.5% stale reads). Whatever had not been copied when the primary died
+    is gone after promotion — for a payments product that is unacceptable. *Synchronous*
+    replication makes the primary wait for a replica's confirmation before acknowledging, so the
+    replica always has every committed write: **RPO = 0**, for about +3 ms per write.
+
+  ### The trap: counting nodes after the failover
+  With one replica, failover leaves you with **one** node doing everything. At month-end
+  traffic (×1.4) that is ~1,600 units/s on a medium (~1,500): the new primary saturates, threads
+  pile up, and p99 reaches **~770 ms** with 3.5% errors. And it has no replica left, so the next
+  crash is a total outage again (**43% errors** in the second-failure test). The reference uses
+  **two** synchronous replicas: after one promotion there is still a replica to share reads and a
+  standby to promote.
+
+  ### Alternatives and why not
+  - **One large replica pair** (large + 1 replica) carries the peak, but costs ~$1.21/hr and
+    still has nothing left after a second failure.
+  - **Restore from backup**: RTO in hours, RPO up to the last backup. Fine for analytics, not for
+    invoices.
+  - **Multi-primary**: no failover gap, but write conflicts on the same invoice become your
+    problem. Overkill at 110 writes/s.
+
+  ### Interview takeaway
+  State RTO and RPO first, then design for them: replicas for redundancy, automatic failover for
+  RTO, synchronous replication (or quorum commit) for RPO = 0, and N+1 capacity so the system
+  still meets its SLO *after* losing a node.

@@ -1,0 +1,25 @@
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+backend/.env
+
+# node
+node_modules/
+dist/
+frontend/.env*.local
+
+# os / editors
+.DS_Store
+.idea/
+.vscode/
+
+# dev runner logs
+.dev/
+
+# local-only
+.claude/
+docs/DEV_ACCOUNT.md
+*.tsbuildinfo

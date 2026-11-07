@@ -1,0 +1,267 @@
+slug: design-google-docs
+kind: problem
+title: Design Google Docs
+difficulty: hard
+day: 16
+summary: Design real-time collaborative editing. Every keystroke is a write, edits to one document must converge, and the op log outgrows any single database.
+topics: [collaborative-editing, operational-transform, crdt, websockets, sharding, message-queue, versioning]
+company_tags: [Google, Microsoft, Notion, Figma, Dropbox, Atlassian, Meta]
+estimated_minutes: 60
+incident: "Launch review · 30M DAU · 6k edit ops/s per cell at peak · design due Friday"
+
+brief_beginner: |
+  You are building **Quill**, a document editor where several people can type in the same
+  document at the same time and see each other's cursors move live. Every keystroke, deletion
+  or formatting change is an **edit operation** ("insert 'a' at position 120").
+
+  Imagine five people editing one shared paper notebook through a single helper. Alice says "add
+  a word on line 3" while Bob says "delete line 2". If the helper applies them in a different
+  order on different copies, the copies end up different. The helper's real job is to put
+  everyone's changes in one agreed order and adjust each change so it still means what the
+  person intended. That adjusting is what **OT** and **CRDTs** are about (see the glossary).
+
+  This workload is unusual: most systems mostly read, but here **three out of four requests are
+  writes**. At peak a single region receives **8,000 requests per second**, of which 6,000 are
+  edit operations. Every one must be saved, in order, and never lost. Today each edit is written
+  straight into one database, which cannot keep up.
+
+  Two more words. A **queue** (here, an **op log**) is a durable list of edits in arrival order that
+  background workers save at their own pace. **Sharding** splits the data across several databases
+  by document, so each database handles only some of the documents.
+
+  **Your job:** design a backend that accepts edits quickly, saves every one of them, loads
+  documents fast, and keeps working when a collaboration server crashes or everyone starts typing
+  at once. Then explain in writing how concurrent edits are merged.
+
+brief_expert: |
+  **Functional:** create/open/edit documents concurrently, live cursors and presence, version
+  history with restore, comments, sharing permissions. Offline editing is a stretch goal.
+
+  **Non-functional:** local echo is instant (client-side); remote edits visible to collaborators in
+  < 200 ms; server ack p99 < 120 ms; **no acknowledged edit is ever lost**; all replicas of a
+  document converge; 99.95% availability.
+
+  **Scale:** 30M DAU, ~5M concurrently editing at peak, clients batch keystrokes into ops every
+  ~100–200 ms. Modelled cell: **8k rps, 75% edit ops, 25% document opens and history reads**
+  (~70% of reads are cacheable snapshots). One op ≈ 100 B; ~500M ops/day/cell ≈ 50 GB/day of op
+  log before compaction into snapshots. Some documents (company all-hands notes) draw hundreds of
+  editors at once.
+
+  The starter writes every op synchronously to one PostgreSQL: 6,000 writes/s × 1.5 units is more
+  than the largest node can take. Put a durable, document-partitioned op log on the write path,
+  persist through workers into a store sharded by `doc_id`, and cache snapshots. Hidden tests kill
+  collaboration servers and burst traffic.
+
+glossary:
+  - term: Operational Transformation (OT)
+    meaning: A server puts all edits to a document in one order and rewrites ("transforms") each incoming edit against the ones it missed, so "insert at 120" becomes "insert at 125" if someone typed five characters earlier. Google Docs uses OT.
+  - term: CRDT
+    meaning: Conflict-free replicated data type. Every character gets a unique, ordered ID, so edits can be merged in any order and all copies still converge, without a central server deciding the order. Used by Figma-style and offline-first editors.
+  - term: Op log
+    meaning: The append-only list of every edit to a document, in order. The current document is the last snapshot plus the ops after it.
+  - term: Snapshot
+    meaning: A saved full copy of a document at some version, so opening it does not require replaying millions of ops.
+  - term: Sharding
+    meaning: Splitting data across several independent databases by a key (here, the document ID) so each handles a fraction of the writes.
+
+requirements:
+  - p99 latency under 120 ms at 8,000 req/s (75% edits)
+  - Error rate under 0.5%
+  - Op log lag under 3 s; no lost edits, ever
+  - Survive two collaboration servers crashing and a 50% burst of typing
+  - Stay within $8.20/hr
+
+budget: 8.2
+palette: [load_balancer, app_server, cache, database, queue, worker]
+
+starter:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, config: {health_checks: false}, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Collab servers, config: {size: xlarge, instances: 6}, position: {x: 480, y: 160}}
+    - {id: db, type: database, label: Document store, config: {size: xlarge, indexes: "id, doc_id"}, position: {x: 720, y: 160}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, config: {health_checks: true}, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Collab servers, config: {size: xlarge, instances: 8}, position: {x: 480, y: 160}}
+    - {id: redis, type: cache, label: Snapshot cache, config: {memory_gb: "16", ttl_s: 600, stampede_protection: true}, position: {x: 720, y: 0}}
+    - {id: oplog, type: queue, label: Op log, config: {partitions: 4}, position: {x: 720, y: 320}}
+    - {id: workers, type: worker, label: Op appliers, config: {size: xlarge, instances: 5}, position: {x: 960, y: 320}}
+    - {id: db, type: database, label: Document store, config: {size: large, indexes: "id, doc_id", shards: 6, shard_key: hash_user}, position: {x: 1200, y: 160}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: redis}
+    - {source: api, target: db}
+    - {source: api, target: oplog}
+    - {source: oplog, target: workers}
+    - {source: workers, target: db}
+
+tests:
+  - id: monday-morning
+    name: Monday 9 am
+    summary: 8,000 req/s, 75% edit operations
+    scenario:
+      base_rps: 8000
+      read_ratio: 0.25
+      cacheable: 0.7
+      working_set_gb: 12
+      hot_key_share: 0.05
+      query_column: doc_id
+    assertions:
+      - {metric: p99_ms, op: lte, value: 120}
+      - {metric: error_rate, op: lte, value: 0.5}
+      - {metric: queue_lag_s, op: lte, value: 3}
+  - id: collab-crash
+    name: Two collaboration servers crash
+    summary: Two instances die at t=20s; their editors reconnect elsewhere
+    hidden: true
+    scenario:
+      base_rps: 8000
+      read_ratio: 0.25
+      cacheable: 0.7
+      working_set_gb: 12
+      hot_key_share: 0.05
+      query_column: doc_id
+      events: [{at: 20, type: kill_app_instance, count: 2}]
+    assertions:
+      - {metric: error_rate, op: lte, value: 2.0}
+      - {metric: p99_ms, op: lte, value: 200}
+      - {metric: write_loss_rate, op: lte, value: 0}
+  - id: all-hands
+    name: All-hands starts
+    summary: Traffic up 50% for 15 seconds, one company-wide doc takes 10% of all ops
+    hidden: true
+    scenario:
+      base_rps: 8000
+      read_ratio: 0.25
+      cacheable: 0.7
+      working_set_gb: 12
+      hot_key_share: 0.1
+      query_column: doc_id
+      spikes: [{at: 20, duration: 15, multiplier: 1.5, ramp: 3}]
+    assertions:
+      - {metric: error_rate, op: lte, value: 0.5}
+      - {metric: p99_ms, op: lte, value: 300}
+      - {metric: queue_lag_s, op: lte, value: 8}
+      - {metric: write_loss_rate, op: lte, value: 0}
+
+hints:
+  - Do the write math first. 6,000 ops/s at 1.5 units each is 9,000 units of write work per second, and only the primary takes writes. The largest single node does 8,000. Replicas will not help; what splits writes?
+  - Put a durable op log on the write path (App → Queue → Workers → Document store) so a collaboration server can ack an op in milliseconds, and shard the store by document. Size the shards so the busiest one, which also carries any hot document, stays below ~70%.
+  - Workers turn queue backlog into database writes, so their drain rate must exceed the average op rate but must not exceed what the busiest shard can absorb during a burst. Then check what the load balancer does with a crashed server, and keep enough spare collaboration capacity to lose two.
+
+design_prompt: |
+  Answer in writing. Precision matters more than breadth.
+
+  1. **Concurrency control: OT or CRDT?** Pick one for this product and justify it. Work through
+     a concrete conflict: the document is "abc", Alice inserts "X" at position 1 while Bob deletes
+     position 2, concurrently. Show what each side receives and how both converge to the same text.
+     What does your choice require of the server (central ordering or not), and what does it cost in
+     memory or metadata?
+  2. **Session routing.** All editors of one document must see one order of ops. How do you route
+     every editor of a document to the same collaboration server (or partition), and what happens
+     to the document's session when that server crashes? How do clients resume without losing or
+     duplicating ops they had in flight?
+  3. **Storage and versioning.** Describe the op log and snapshot schema, the shard key, and the
+     compaction policy (when do you snapshot, and what do you keep). How do you implement version
+     history and "restore to version N" without blocking current editors?
+  4. **Presence.** How do you deliver live cursors and "who is viewing" for 100 editors in one
+     document without writing them to the database? What happens to presence when a client
+     disconnects silently?
+  5. **Hot documents and offline.** A company-wide document has 500 simultaneous editors. What breaks
+     first and how do you cap or degrade it? If a user edits offline for an hour, how are those edits
+     merged when they reconnect, and how does that differ between OT and CRDT?
+
+editorial: |
+  ### 1. Requirements
+  * **Functional:** concurrent editing, presence and cursors, version history, permissions.
+  * **Non-functional:** instant local echo, < 200 ms remote propagation, convergence, durability of
+    every acknowledged op, availability.
+
+  ### 2. Estimation
+  | quantity | value |
+  |---|---|
+  | concurrent editors | ~5M at peak globally |
+  | ops | clients batch every ~150 ms while typing → ~6k ops/s in the modelled cell |
+  | write work | 6,000 × 1.5 = 9,000 units/s: above one xlarge node (8,000) |
+  | op log | 100 B × ~500M ops/day ≈ 50 GB/day/cell, compacted into snapshots |
+  | snapshot cache | active documents ≈ 12 GB |
+
+  ### 3. High-level design
+  ```
+  Clients ⇄ LB (health checks) ⇄ Collab servers (one owner per doc, OT in memory)
+      edits   → Op log (Kafka, partitioned by doc_id) → Op appliers → Document store (6 shards by doc_id)
+      opens   → Snapshot cache (Redis) → Document store on miss
+      presence → in-memory on the doc owner, fanned out over WebSockets, never persisted
+  ```
+
+  ### 4. Why the starter fails
+  9,000 write units per second on one xlarge (8,000): the primary saturates, the queue inside it
+  grows, every synchronous edit waits behind it, and collaboration server threads block. Replicas
+  only add read capacity. The only fixes for write throughput are fewer writes (batching) or more
+  primaries (shards).
+
+  ### 5. The fix, with numbers
+  * **Op log:** an append takes ~2 ms, so a server acks an op as soon as it is durable in the log.
+    Four partitions accept 20k msgs/s.
+  * **Appliers:** five xlarge workers drain ~7,700 ops/s against 6,000 arriving (78% busy), so
+    the backlog stays at zero in steady state and clears quickly after a burst.
+  * **Store:** six large shards keyed by `doc_id`. With a 5% hot share the busiest shard takes
+    `0.05 + 0.95 / 6 ≈ 21%` of writes: ~1,900 units, ~60% busy including reads.
+  * **Collab tier:** ~9,800 units of work on 8 xlarge instances: ~60% busy.
+
+  ### 6. Deep dives
+  **OT vs CRDT.** OT needs a single serialization point per document (the collaboration server that
+  owns it), which fits a server-centric product and keeps metadata small; it is what Google Docs
+  does. CRDTs (RGA, Yjs, Automerge) need no central order and handle offline edits and peer-to-peer
+  naturally, at the cost of per-character IDs and tombstones (documents grow, garbage collection is
+  hard). Either is defensible; the answer must explain convergence with a concrete example.
+
+  **Routing.** Consistent hashing on `doc_id` (or a lookup in a coordination service) assigns each
+  document to one collaboration server. On failure, ownership moves; the new owner rebuilds state
+  from the latest snapshot plus the op-log tail. Clients keep unacknowledged ops locally with their
+  client sequence numbers and resend after reconnect; the server de-duplicates by
+  `(client_id, client_seq)`.
+
+  **Versioning.** Snapshot every N ops (say 1,000) or on idle; version history is the list of
+  snapshots plus named checkpoints. Restoring creates a new op that replaces content, so history
+  stays append-only and concurrent editors simply receive it.
+
+  **Presence.** Ephemeral state on the owning server, broadcast to the document's sockets, with a
+  heartbeat timeout (for example 30 s). Persisting cursors would multiply write load for no value.
+
+  ### 7. What the hidden tests probe
+  * **Two servers crash:** without health checks a quarter of requests keep going to dead instances
+    (~16% errors). With them, errors are limited to the ~3 s detection window and six xlarge
+    instances carry the load at ~80%. The op log keeps every acknowledged edit.
+  * **All-hands (1.5× and a 10% hot document):** arrivals reach 9,000 ops/s, above the appliers'
+    drain rate, so the log absorbs ~17k ops (about 2 s of lag) and catches up within seconds. The
+    busiest shard peaks near 90%. Synchronous writes saturate the busiest shard and time out. Too many appliers move
+    the problem: seven of them drain faster than the busiest shard can write, and its queueing pushes
+    p99 past the limit.
+
+  ### 8. Common mistakes
+  * Writing each keystroke synchronously to the database.
+  * Adding read replicas to fix a write bottleneck.
+  * Last-writer-wins on whole documents (loses edits) or locking paragraphs (kills collaboration).
+  * Storing presence and cursors in the database.
+  * Sharding by user instead of document, which splits one document's ops across shards and loses
+    the single ordering point.
+
+  ### 9. What good answers look like
+  * **E4:** WebSockets, a server that orders ops per document, op log plus snapshots, shard by
+    document, cache snapshots.
+  * **E5:** a correct OT or CRDT walk-through with a concrete conflict, ownership routing and
+    failover with client resend and de-duplication, compaction and version history, ephemeral
+    presence.
+  * **E6:** OT vs CRDT trade-offs including offline and tombstone GC, hot-document limits and
+    degradation (viewer mode above N editors), permission changes mid-session, multi-region
+    ownership with a home region per document, and how comments and suggestions anchor to text that
+    keeps moving.

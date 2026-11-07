@@ -1,0 +1,178 @@
+- slug: fan-out-strategies
+  day: 15
+  title: "Fan-out: on write vs on read"
+  minutes: 11
+  summary: A timeline can be assembled when someone posts (push to every follower) or when someone reads (pull from everyone they follow), and real systems mix both because of celebrities.
+  plain: |
+    When you open a social app, you see a **timeline** (or feed): recent posts from everyone you
+    follow, newest first. Building it means gathering posts from many people. **Fan-out** is the
+    word for one thing spreading out to many places. There are two ways to do it.
+
+    **Fan-out on write (push).** When someone posts, the system immediately copies a reference to
+    that post into the timeline of every follower. Like a newspaper delivered to every subscriber's
+    doorstep the moment it is printed. Reading is instant, because your timeline is already built and
+    waiting. Posting is expensive: a person with 1,000 followers causes 1,000 deliveries.
+
+    **Fan-out on read (pull).** Nothing happens when someone posts. When you open the app, the system
+    fetches the latest posts from each person you follow and merges them. Like walking to every
+    newsstand yourself each morning. Posting is cheap; reading is expensive, and it happens every
+    time anyone opens the app.
+
+    Most people read far more than they post, so push sounds better. Then you meet the **celebrity
+    problem**. A pop star with 100 million followers posts once, and push means 100 million
+    deliveries for a single post. That takes a long time, and it happens again with the next post.
+
+    The usual answer is a **hybrid**:
+
+    - Ordinary users' posts are pushed to followers' timelines.
+    - Celebrities' posts are *not* pushed. When you open your timeline, the system takes your
+      pre-built timeline and mixes in recent posts from the few celebrities you follow.
+
+    Each approach is used where it is cheap, which is the theme of this whole course.
+  deeper: |
+    ### Rough Twitter-scale numbers
+    ```
+    posts:           ~500 M/day        ≈ 6k/s avg, ~15k/s peak
+    timeline reads:  ~100-300k/s
+    avg followers:   ~200; heavy tail to 100 M+
+    push cost:       6k/s x 200       ≈ 1.2 M timeline inserts/s
+    pull cost:       200k reads/s x ~200 followees = 40 M post lookups/s
+    ```
+    Push moves work to the write side, where it is asynchronous and can lag; pull puts it on the
+    latency-critical read path. With reads outnumbering posts by ~30x and a timeline needing ~200
+    sources, push wins for ordinary accounts.
+
+    ### Comparison
+    | | Fan-out on write | Fan-out on read |
+    |---|---|---|
+    | Post latency to followers | seconds (async workers) | immediate |
+    | Read latency | one cache read (~1 ms) | scatter-gather over followees, tail-bound |
+    | Storage | O(followers) per post | O(1) per post |
+    | Wasted work | pushing to inactive users | none |
+    | Breaks on | celebrities, mass follow/unfollow | users following thousands |
+
+    ### Hybrid in practice
+    ```
+    on post(author):
+      if author.followers < 10k-100k: enqueue fan-out job -> workers push post_id to each follower timeline
+      else: store in author's own recent-posts list only
+    on read(user):
+      ids = timeline_cache[user]                       # pushed entries
+      for c in user.followed_celebrities: ids += recent_posts[c][:N]
+      return rank(merge(ids))[:page]
+    ```
+    The threshold is tuned from cost: fan-out cost scales with follower count; pull cost scales with
+    how many celebrities an average reader follows (usually a handful).
+
+    ### Details that matter
+    - **Fan-out goes through a queue**: a post returns after persisting; workers deliver. Lag is
+      measured and alerted on.
+    - **Skip inactive users**: do not push to accounts inactive for 30 days; rebuild their timeline
+      on next login via pull.
+    - **Deletes and unfollows**: filter at read time (check post still exists, author still followed)
+      rather than synchronously removing from millions of timelines.
+    - **Ranking**: ranked feeds still use push or pull to build a candidate set, then score it.
+
+    ### Failure modes
+    - A celebrity just below the threshold creates multi-minute fan-out lag for everyone queued
+      behind it; partition fan-out jobs so one author does not block others.
+    - Hot followee storms: a viral account gaining millions of followers.
+    - Pull for heavy-following users becomes a 5,000-way scatter-gather; cap followees considered.
+
+    Interviewers expect the push vs pull trade-off with numbers, the celebrity problem stated
+    unprompted, a hybrid with a threshold, and async fan-out via a queue.
+  key_points:
+    - "Fan-out on write pre-builds timelines at post time: cheap reads, expensive posts proportional to follower count."
+    - "Fan-out on read assembles timelines at read time: cheap posts, expensive and tail-sensitive reads."
+    - "Reads vastly outnumber posts, so push suits ordinary accounts; celebrities make push explode."
+    - "Hybrid: push for most authors, pull and merge celebrity posts at read time."
+    - "Run fan-out asynchronously through a queue and skip inactive users."
+  concepts: [fan-out-on-write, fan-out-on-read, hybrid-fan-out, celebrity-problem]
+
+- slug: timeline-caching
+  day: 15
+  title: Timeline caching
+  minutes: 10
+  summary: Store each active user's timeline as a short list of post IDs in Redis, then fill in the post contents from a separate cache, and size it with simple memory arithmetic.
+  plain: |
+    Fan-out on write needs somewhere to keep every user's pre-built timeline, and it must be fast,
+    because opening the app reads it. The usual place is a **cache** in memory, such as **Redis**.
+
+    The key trick is to store **IDs, not posts**. Each user's timeline is just a list of post
+    numbers: `[98123, 98117, 98090, ...]`. The post itself (text, author, image link, like count)
+    lives once, in a separate place, the **post cache**. When you open the app:
+
+    1. Read your list of the newest 20 post IDs.
+    2. Look up those 20 posts in the post cache in one batch.
+    3. Fill in the authors' names and pictures from a user cache.
+
+    Turning IDs into full objects like this is called **hydration**. It is like a library
+    catalogue card that holds only a shelf number; you fetch the book itself when you need it.
+
+    Why bother? If a post is copied into a million timelines, storing the whole post a million times
+    would waste enormous memory, and editing it would mean changing a million copies. An ID is just 8
+    bytes.
+
+    Two more choices keep the cache affordable:
+
+    - **Cap the list.** Keep only the latest few hundred IDs per user. Almost nobody scrolls back
+      further; if they do, fall back to the slower database.
+    - **Only cache active users.** Someone who has not opened the app in a month does not need a
+      timeline sitting in memory. Build it again if they return.
+
+    With these, a timeline cache for hundreds of millions of users fits in a cluster of memory
+    servers, and opening the app takes milliseconds.
+  deeper: |
+    ### Data structures
+    ```
+    timeline:{user_id}   Redis list or sorted set of post_ids, newest first
+      push:  LPUSH timeline:42 98123 ; LTRIM timeline:42 0 799
+      read:  LRANGE timeline:42 0 19            # first page
+    post:{post_id}       hash: author_id, text, media_url, created_at
+    counts:{post_id}     like/reply counts, updated separately (hot, write-heavy)
+    ```
+    A sorted set scored by post ID or timestamp supports cursor pagination (`ZREVRANGEBYSCORE` below
+    the last seen score) and idempotent inserts, at about twice the memory of a list.
+
+    ### Memory arithmetic
+    ```
+    active users cached:   200 M
+    entries per timeline:  800 post IDs x 8 B      = 6.4 KB raw
+    with Redis overhead (~2-3x for small structures) ≈ 15-20 KB
+    total:                 200 M x 20 KB           ≈ 4 TB
+    -> ~65-125 nodes at 32-64 GB usable, before replication
+    ```
+    Capping at 800 and caching only users active in the last 30 days are the two biggest levers;
+    halving either halves the cluster. Twitter's published design used roughly this shape: capped
+    per-user ID lists in Redis, hydrated from separate tweet and user stores.
+
+    ### Read path latency
+    One `LRANGE` (~1 ms) plus one pipelined `MGET`/`HMGET` for 20 posts (~1 to 2 ms) plus a batched
+    user lookup. Avoid N+1 lookups: 20 sequential round trips at 0.5 ms each is 10 ms of pure network
+    wait.
+
+    ### Rebuild and consistency
+    - **Cache miss** (new or returning inactive user): rebuild by pulling recent posts from followees
+      (fan-out on read once), write the list, then serve.
+    - **Deleted posts**: hydration returns nothing for them; drop silently and backfill the page.
+    - **Counts** change constantly; keep them out of the post object so post caches stay valid with
+      long TTLs.
+    - **Replication**: a lost timeline shard is rebuildable from the source of truth, so a replica is
+      for availability, not durability. Persistence settings can be relaxed accordingly.
+
+    ### Failure modes
+    - A cold timeline cluster after an outage forces mass rebuilds through fan-out on read; rate-limit
+      rebuilds and serve a degraded "recent popular" feed meanwhile.
+    - Hot celebrity post IDs make their post-cache shard hot; add a short-TTL in-process cache in
+      front of it.
+    - Unbounded lists from a fan-out bug; always `LTRIM` on write.
+
+    Interviewers look for ID lists plus hydration, a cap, active-user filtering, memory math that
+    lands on a node count, and a plan for misses and cold starts.
+  key_points:
+    - "Cache timelines as capped lists of post IDs, and hydrate post and user data from separate caches."
+    - "Storing IDs instead of posts saves memory and keeps edits and deletes in one place."
+    - "Cap list length and cache only recently active users; both directly scale memory cost."
+    - "Batch hydration lookups in one round trip to avoid N+1 latency."
+    - "Timeline caches are rebuildable from the source of truth; plan rebuild rate for misses and cold starts."
+  concepts: [timeline-cache, hydration, capped-lists, cache-memory-estimation]

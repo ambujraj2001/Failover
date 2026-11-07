@@ -1,0 +1,93 @@
+- slug: distributed-locks
+  day: 16
+  title: Distributed locks and leases
+  minutes: 10
+  summary: "How several machines agree that only one of them may touch a resource at a time, and why a lock without a fencing token is only a hint."
+  plain: |
+    A **lock** is a rule that says "only one worker may do this right now". Inside one program it is easy: the operating system hands out the lock and takes it back if the program crashes. Across many machines there is no single operating system, so a **distributed lock** has to be held by a shared service that every machine can reach, such as Redis, ZooKeeper or etcd.
+
+    Think of the single key to a shared office bathroom, hanging at reception. You take the key, you use the room, you return the key. Now imagine someone takes the key and falls asleep inside. Reception cannot wait forever, so it hands out keys that **expire**: after five minutes the key stops working and reception may give out a new one. That expiring key is a **lease** — a lock with a time limit.
+
+    The danger is the sleeper who wakes up after their lease ran out and walks back in, not knowing someone else now has the room. In software this happens all the time: a process pauses for garbage collection or a virtual machine is frozen for a second. The fix is a **fencing token**: every time the lock is granted, the lock service hands out a number that only goes up (33, then 34). The resource being protected, for example the database, remembers the highest number it has seen and rejects any request carrying an older one. The sleeper shows token 33, the database has already seen 34, and the stale write is refused.
+
+    Use locks sparingly. Most of the time a database constraint or a single-writer design does the job with fewer moving parts.
+  deeper: |
+    ### Two different reasons to lock
+    Kleppmann's split is the one interviewers expect you to know:
+
+    | Purpose | Cost of a double holder | Good enough |
+    |---|---|---|
+    | **Efficiency** (avoid doing a cron job twice) | some wasted work | single Redis `SET key val NX PX 30000` |
+    | **Correctness** (never double-charge, never corrupt a file) | real damage | consensus-backed store (etcd, ZooKeeper) **plus** fencing tokens checked by the resource |
+
+    Redlock (acquire on a majority of 5 independent Redis nodes) does not give you correctness: it assumes bounded clock drift and bounded pauses, and it produces no monotonic token. If correctness matters, the resource itself has to enforce ordering.
+
+    ### Fencing in practice
+    ```sql
+    UPDATE jobs SET owner = :me, fence = :token
+    WHERE id = :id AND fence < :token;   -- 0 rows -> you lost the lock
+    ```
+    In etcd the key's `mod_revision` is a free fencing token; in ZooKeeper use the sequential znode number. Object stores can do the same with conditional writes (`If-Match` on an ETag).
+
+    ### Lease sizing
+    - TTL must exceed the worst realistic pause. JVM full GCs of 1–5 s and VM live migrations of several seconds are real; 10–30 s leases with renewal every TTL/3 are typical.
+    - Long TTLs mean a crashed holder blocks everyone for the full TTL. Short TTLs mean more spurious expiry. There is no free setting, which is why fencing is mandatory.
+    - Never compute "do I still hold it" from the local wall clock alone; NTP can step time backwards.
+
+    ### When not to use a lock
+    - A row-level `SELECT ... FOR UPDATE` or a unique constraint already serialises the work inside one database.
+    - Partition the work so one owner per key exists by construction (Kafka partition per key, actor per document). Single-writer beats locking.
+    - Optimistic concurrency (version column, compare-and-set) wins when conflicts are rare.
+
+    ### What interviewers probe
+    "What happens if the lock holder pauses for 40 s?" "What if the Redis primary fails over before replicating the lock key?" (async replication can lose it, so two holders exist). A strong answer names the fencing token and where it is checked.
+  key_points:
+    - "A distributed lock is a lease: it must expire, so a paused holder can wake up believing it still owns it."
+    - "Fencing tokens (monotonic numbers checked by the protected resource) are what make a lock safe for correctness."
+    - "Redis SET NX PX is fine for efficiency locks; correctness needs a consensus store plus fencing."
+    - "Prefer single-writer partitioning, unique constraints or compare-and-set before reaching for a lock."
+  concepts: [distributed-lock, lease, fencing-token, redlock, optimistic-concurrency]
+
+- slug: consensus-and-raft
+  day: 16
+  title: Consensus, leader election and Raft
+  minutes: 12
+  summary: "How a small group of servers agrees on one ordered log even when some of them crash, and how collaborative editors avoid needing consensus at all."
+  plain: |
+    **Consensus** means a group of machines agreeing on a single value, or a single ordered list of decisions, even if some machines crash or messages are delayed. It is the foundation under every reliable lock service, configuration store and leader election.
+
+    Picture a five-person committee that keeps one shared minute book. One member is the **leader**: only the leader writes proposals into the book. Before a line counts as decided, the leader reads it to the others and waits until a **majority** (three of five, counting itself) say "noted". If the leader goes silent, the others wait a short random time, then one of them calls an election, asking for votes. Whoever gets a majority becomes the new leader for a new numbered **term**. Because two different majorities of five always share at least one person, two leaders can never both get a decision accepted in the same term.
+
+    **Raft** is the most widely taught consensus algorithm, built exactly on this committee idea: leader election, log replication, and a rule that a decision is **committed** once a majority has stored it. etcd (the brain of Kubernetes) and Consul use Raft; ZooKeeper uses a close cousin called Zab.
+
+    A different problem looks similar: many people typing into the same document. There you do not want a vote on every keystroke. **Operational transformation (OT)** sends edits through a central server that adjusts them so they still make sense, and **CRDTs** (conflict-free replicated data types) are data structures designed so that edits merged in any order end up identical everywhere.
+  deeper: |
+    ### Raft in numbers
+    - Cluster of `2f + 1` tolerates `f` failures: 3 nodes survive 1, 5 survive 2. Even sizes add cost without adding tolerance (4 nodes still survive only 1).
+    - A write costs one leader-to-majority round trip plus an fsync. In one region that is ~1–5 ms; spread across regions it is bounded by the second-closest replica's RTT, often 30–100 ms.
+    - Election timeouts are randomised (the paper uses 150–300 ms; etcd defaults to 100 ms heartbeat and 1 s election timeout) so split votes are rare. Failover is therefore roughly a second or two, not instant.
+    - Reads must also be linearizable: either go through the log, use a ReadIndex round, or use leader leases (which reintroduce clock assumptions).
+
+    ### What consensus is for, and what it is not for
+    Use it for small, critical metadata: who the leader is, shard maps, locks, feature flags, service discovery. etcd's default storage quota is 2 GB and it is happiest at thousands to low tens of thousands of writes/s. Putting user data or a high-volume queue into it is a classic mistake. Systems that need consensus over large data (Spanner, CockroachDB, TiKV) run **one Raft group per range** of a few hundred MB and shard across thousands of groups.
+
+    ### Failure modes
+    - Network partition: the minority side cannot commit, so it becomes unavailable for writes. That is the CP choice, by design.
+    - Disk latency: a slow fsync on the leader stalls every write. etcd recommends SSDs and watches `wal_fsync_duration`.
+    - Losing quorum permanently (2 of 3 disks gone) requires manual, unsafe recovery. Spread members across failure domains.
+
+    ### OT vs CRDT for collaborative editing
+    | | OT | CRDT |
+    |---|---|---|
+    | Topology | central server orders ops (Google Docs) | peer-to-peer or server, any order |
+    | Offline edits | awkward | natural |
+    | Cost | server CPU, complex transform functions | metadata per character, tombstones; Yjs and Automerge keep overhead small but non-zero |
+    | Typical use | server-hosted docs | local-first apps, Figma-style multiplayer (Figma uses a server-authoritative CRDT-inspired model) |
+
+    Neither needs Raft per keystroke; durability comes from the server persisting the op log. Interviewers want you to say "one leader per document" for ordering, and to explain why per-keystroke consensus across regions would cost 100 ms per character.
+  key_points:
+    - "Raft commits an entry once a majority stores it; 2f+1 nodes tolerate f failures, so use 3 or 5."
+    - "Leader election uses randomised timeouts; failover takes about a second, and the minority side of a partition stops accepting writes."
+    - "Consensus stores are for small critical metadata, not bulk data; large systems shard into many Raft groups."
+    - "Collaborative editors use OT (central ordering) or CRDTs (order-independent merge) instead of consensus per edit."
+  concepts: [raft, leader-election, quorum, operational-transformation, crdt]

@@ -1,0 +1,156 @@
+- slug: requirements-first
+  day: 1
+  title: Requirements first
+  minutes: 9
+  summary: Before drawing a single box, pin down what the system must do and how well it must do it, because those numbers decide every later choice.
+  plain: |
+    Imagine asking a builder for "a house". They cannot start. Is it for two people or ten? On a
+    hill or a floodplain? A budget of fifty thousand or five million? Every wall they draw depends
+    on answers you have not given yet. Software is the same.
+
+    **Requirements** are the answers. They come in two kinds:
+
+    - **Functional requirements** say *what* the system does. "A user can shorten a long link."
+      "Anyone with the short link is redirected to the long one."
+    - **Non-functional requirements** say *how well* it does it. "A redirect takes less than 100
+      milliseconds." "The service is up 99.9% of the time." "We expect 4,000 redirects per second."
+
+    The second kind is where design actually happens. A link shortener for a classroom of 30
+    people runs fine on a laptop. The same features for 100 million people need caches, replicas
+    and several data centres. The features did not change; the numbers did.
+
+    Some terms you will see all course:
+
+    - **Availability**: the share of time the system answers correctly. 99.9% sounds perfect, but
+      it still allows about 43 minutes of downtime a month.
+    - **Read/write ratio**: how often people look at data compared to how often they change it.
+      Opening links is a read; creating one is a write.
+    - **Consistency**: whether everyone sees the latest data immediately, or whether a short delay
+      is acceptable.
+
+    The habit to build: before you design anything, write down three to five features and five
+    or six numbers. Then design for those numbers, not for an imaginary worst case.
+  deeper: |
+    ### What to pin down, in order
+    1. **Core use cases** (3 to 5). Explicitly park the rest: "no analytics, no custom aliases".
+    2. **Scale**: daily active users, requests per second at average and peak, data growth per year.
+    3. **Read/write ratio**: 100:1 points you at caching and replicas; 1:1 points you at write paths,
+       queues and partitioning.
+    4. **Latency target**, stated as a percentile: "p99 under 200 ms", never "fast".
+    5. **Availability target** and what "down" means (any error? only the core path?).
+    6. **Consistency**: which data must be read-your-writes (balances, permissions) and which can
+       lag by seconds (like counts, feeds).
+
+    ### Availability is a budget
+    | Target | Downtime / year | Downtime / 30 days |
+    |---|---|---|
+    | 99% | 3.65 days | 7.2 h |
+    | 99.9% | 8.77 h | 43.2 min |
+    | 99.99% | 52.6 min | 4.3 min |
+    | 99.999% | 5.26 min | 26 s |
+
+    Components in series multiply: an LB (99.99%), an app tier (99.95%) and a database (99.9%)
+    give `0.9999 × 0.9995 × 0.999 ≈ 99.84%`, worse than the weakest part. Redundant copies in
+    parallel combine as `1 − (1 − a)^n`: two independent 99% replicas give 99.99%, provided their
+    failures really are independent (same rack, same deploy, same bug means they are not).
+
+    Each extra nine costs roughly an order of magnitude more: 99.99% means a human cannot be in the
+    loop for recovery, because 4 minutes a month is less than the time to get paged and log in.
+
+    ### Failure modes of skipping this step
+    - Designing for "Google scale" when the spec is 50 rps: sharding and Kafka where one
+      PostgreSQL instance and a cache would do.
+    - Designing for averages: a 3x peak-to-average ratio is normal, 10x on launch days.
+    - Missing the dominant operation: a URL shortener is a redirect service with a small write path
+      attached, not the other way round.
+
+    ### What interviewers probe
+    They watch whether you ask before you draw, whether your questions change the design ("if
+    edits must be visible instantly, I will read from the primary for that user"), and whether you
+    state assumptions out loud when they say "you decide". Spend 3 to 5 minutes here, not 15.
+  key_points:
+    - "Functional requirements say what the system does; non-functional requirements (scale, latency, availability, consistency) drive the architecture."
+    - "State latency as a percentile and availability as nines, then convert nines to minutes of allowed downtime."
+    - "Availabilities multiply in series and combine as 1 - (1 - a)^n in parallel, only if failures are independent."
+    - "The read/write ratio is the single most useful number for choosing between caching, replicas and write scaling."
+    - "Write down 3 to 5 features and 5 or 6 numbers before drawing any boxes."
+  concepts: [functional-requirements, non-functional-requirements, availability-nines, read-write-ratio]
+
+- slug: latency-throughput-percentiles
+  day: 1
+  title: Latency, throughput and percentiles
+  minutes: 10
+  summary: Latency is how long one request takes, throughput is how many you finish per second, and percentiles describe the slow requests that averages hide.
+  plain: |
+    Think of a coffee shop. **Latency** is how long you personally wait from ordering to holding
+    your cup. **Throughput** is how many cups the shop hands out per hour. They are related but
+    different: a shop can serve 300 cups an hour and still make you wait 20 minutes if the queue is
+    long.
+
+    In software, latency is measured in **milliseconds** (ms, thousandths of a second) and
+    throughput in **requests per second** (rps, or qps for queries per second).
+
+    Now the important part. If you ask "how long do customers wait on average?", you might hear
+    "2 minutes". But that average can hide the customer whose order was lost and who waited 25
+    minutes. That customer is the one who writes the angry review.
+
+    **Percentiles** fix this. Line up every request from fastest to slowest:
+
+    - **p50** (the median): half of requests are faster than this. The typical experience.
+    - **p99**: 99 out of 100 requests are faster than this. The unlucky 1%.
+    - **p99.9**: the unlucky 1 in 1,000.
+
+    At 4,000 requests per second, "1%" is 40 people every second. A heavy user who loads a page
+    with 50 requests behind it will hit the p99 on most page loads. That is why engineers obsess
+    over p99, not the average.
+
+    One more idea: when a server gets busy, latency does not grow gently. It is fine at half
+    capacity, a bit slower at 80%, and terrible at 95%, because requests start waiting in a queue
+    behind each other, just like the coffee line.
+  deeper: |
+    ### Numbers worth memorising
+    | Operation | Typical latency |
+    |---|---|
+    | Main memory reference | 100 ns |
+    | Read 1 MB sequentially from RAM | ~10 µs |
+    | NVMe SSD random read | ~100 µs |
+    | Round trip within a data centre | ~0.5 ms |
+    | Redis GET (in-DC, incl. network) | ~0.5 to 1 ms |
+    | Indexed PostgreSQL point query | 1 to 5 ms |
+    | Round trip US east to west coast | ~70 ms |
+    | Round trip Europe to US east | ~80 to 90 ms |
+    | Round trip Europe to Australia | ~250 ms |
+
+    ### Little's law
+    `L = λ × W`: requests in flight = arrival rate × time in system. An app instance with 128
+    threads and 20 ms per request can hold at most `128 / 0.020 = 6,400 rps` before threads run out. If the
+    database slows to 2 s, the same 128 threads cap you at **64 rps**. This is how a slow
+    dependency turns into a full outage upstream, and the simulator models it exactly this way.
+
+    ### Utilisation and queueing
+    For a simple single-server queue (M/M/1), mean time in system scales with `1 / (1 − ρ)`, where ρ
+    is utilisation. Relative to an idle server: 50% busy → 2x, 80% → 5x, 90% → 10x, 95% → 20x.
+    Tails blow up faster than means. This is why capacity plans target 50 to 70% at peak, not 95%.
+
+    ### Tail amplification
+    If one page fans out to N backends in parallel and waits for all of them, it is as slow as the
+    slowest. With each backend at 1% slow: `P(page is slow) = 1 − 0.99^N`. N = 10 → 9.6%;
+    N = 100 → 63%. Your backend p99 becomes the page's p50. Mitigations: hedged requests, fewer
+    hops, tighter per-call timeouts, partial results.
+
+    ### Pitfalls
+    - **Never average percentiles** across hosts or time windows. Merge histograms (HDR, t-digest)
+      and recompute.
+    - **Coordinated omission**: load generators that wait for a response before sending the next
+      request under-report tail latency during stalls.
+    - Throughput without a latency bound is meaningless: "10k rps" at a 3 s p99 is not a feature.
+
+    Interviewers expect you to quote p99 targets, reason with Little's law about threads and
+    connections, and explain why a system at 90% utilisation is already in trouble.
+  key_points:
+    - "Latency is time per request; throughput is requests completed per second. A system can have high throughput and terrible latency."
+    - "Use percentiles (p50, p99, p99.9), not averages; never average percentiles, merge histograms instead."
+    - "Little's law, in-flight = rate x latency, explains why a slow dependency exhausts threads upstream."
+    - "Queueing delay grows like 1/(1 - utilisation): plan for 50 to 70% at peak."
+    - "Fan-out amplifies tails: 100 parallel calls at 1% slow each makes 63% of pages slow."
+  concepts: [latency-vs-throughput, p99-latency, littles-law, queueing-delay, tail-latency-amplification]

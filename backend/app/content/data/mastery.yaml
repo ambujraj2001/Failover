@@ -1,0 +1,96 @@
+# The 12 mastery areas and the skills each one covers.
+
+- title: Fundamentals
+  items:
+    - Functional and non-functional requirements
+    - Latency, throughput and percentiles
+    - Availability and the nines
+    - Single points of failure
+    - API design and pagination
+
+- title: Networking
+  items:
+    - DNS, TCP and TLS
+    - L4 and L7 load balancing
+    - CDNs and edge caching
+    - WebSockets, SSE and long polling
+    - Geo routing
+
+- title: Storage
+  items:
+    - SQL vs NoSQL
+    - ACID transactions
+    - Indexes and query plans
+    - Connection limits and pooling
+    - Object storage for media
+
+- title: Caching
+  items:
+    - Cache-aside
+    - Write policies
+    - Eviction and sizing
+    - Invalidation
+    - Stampedes and hot keys
+
+- title: Scaling
+  items:
+    - Stateless services
+    - Vertical vs horizontal scaling
+    - Autoscaling and headroom
+    - Read replicas and read/write split
+    - Fan-out on write vs read
+
+- title: Partitioning
+  items:
+    - Sharding and shard keys
+    - Hash vs range partitioning
+    - Hot partitions and skew
+    - Consistent hashing and virtual nodes
+
+- title: Replication & Consistency
+  items:
+    - Sync vs async replication
+    - Replication lag and read-your-writes
+    - Consistency models
+    - CAP and PACELC
+    - Quorums and multi-region writes
+
+- title: Async & Messaging
+  items:
+    - Queues and pub/sub
+    - Kafka partitions and consumer groups
+    - Back-pressure
+    - Delivery semantics and ordering
+    - Stream processing
+
+- title: Reliability
+  items:
+    - Redundancy and failover
+    - RTO and RPO
+    - SLOs and error budgets
+    - Timeouts, retries and backoff
+    - Circuit breakers and bulkheads
+
+- title: Distributed Systems
+  items:
+    - Distributed locks and fencing
+    - Leader election and Raft
+    - OT and CRDTs
+    - Sagas and the outbox
+    - Idempotency and exactly-once effects
+
+- title: Operations & Security
+  items:
+    - Metrics, logs and traces
+    - Rate limiting
+    - Authentication and authorization
+    - Secrets management
+    - Bot and abuse defence
+
+- title: Algorithms & Estimation
+  items:
+    - Back-of-the-envelope estimation
+    - Little's law and peak factors
+    - Rate-limiting algorithms
+    - Probabilistic sketches
+    - Geospatial indexes

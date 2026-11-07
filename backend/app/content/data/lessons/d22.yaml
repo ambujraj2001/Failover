@@ -1,0 +1,108 @@
+- slug: blob-storage-and-media
+  day: 22
+  title: Object storage and upload pipelines
+  minutes: 10
+  summary: "Where large files belong, how clients upload them straight to storage, and how a processing pipeline turns raw uploads into something servable."
+  plain: |
+    Photos, videos and documents are **blobs** — large chunks of bytes with no internal structure the database cares about. They do not belong in your database. They belong in **object storage** such as Amazon S3 or Google Cloud Storage: a service that stores files under a name (a **key**), practically without limit, at a few cents per gigabyte per month. The database keeps only the metadata: who uploaded it, its key, its size, its status.
+
+    Think of a coat check. You do not carry your coat around the party; you hand it over and get a small ticket. The database row is the ticket; the coat lives in the cloakroom.
+
+    Uploads should not flow through your app servers. A 2 GB video tying up an app server for minutes is a waste. Instead, the app hands the client a **pre-signed URL**: a temporary link, valid for a few minutes, that allows exactly one upload to one key. The client sends the bytes straight to object storage. Large files use **multipart upload**: the file is cut into parts that upload in parallel and can be retried individually, so a dropped connection costs one part, not the whole file.
+
+    When the upload finishes, storage emits an event. A **processing pipeline** picks it up: scan for viruses, check the content is allowed, make thumbnails or other sizes, then mark the item ready. Until then the item shows as "processing". Finished files are served to users through a **CDN** so popular items come from a server nearby rather than from storage every time.
+  deeper: |
+    ### Upload flow
+    ```
+    client -> API: POST /uploads {size, type}        -> row status=PENDING, presigned URLs
+    client -> S3: PUT parts in parallel               (app servers never see the bytes)
+    client -> API: POST /uploads/:id/complete         -> CompleteMultipartUpload
+    S3 event -> queue -> workers: scan, validate, transcode/thumbnail -> status=READY
+    ```
+
+    ### Numbers worth knowing (S3)
+    | Limit | Value |
+    |---|---|
+    | Max object | 5 TB |
+    | Single PUT | up to 5 GB (use multipart above ~100 MB) |
+    | Multipart | 5 MB–5 GB per part, max 10,000 parts |
+    | Durability design target | 99.999999999% (11 nines) |
+    | Request rate | 3,500 writes and 5,500 reads per second per key prefix, scaling with more prefixes |
+    | Standard storage | about $0.023/GB-month; infrequent-access and archive tiers far cheaper |
+
+    First-byte latency is tens of milliseconds (the simulator uses 25 ms), so object storage is never on a hot read path without a CDN in front. Durability comes from erasure coding across devices and AZs, not from full copies.
+
+    ### Design decisions
+    - **Keys**: content-addressed (`sha256/ab/cd/...`) gives free dedupe and immutable caching; random UUID keys are simpler. Never use user-supplied filenames as keys.
+    - **Immutability**: never overwrite an object in place; write a new key and update the pointer. CDN caches then never serve stale bytes, and you can set `Cache-Control: max-age=31536000, immutable`.
+    - **Lifecycle rules**: move originals to cold storage after 30–90 days; delete abandoned multipart uploads after a day (they are billed).
+    - **Access**: private bucket, short-lived signed URLs or signed CDN cookies for private media; never a public bucket by accident.
+
+    ### Failure modes
+    - Client never calls complete: sweep PENDING rows older than 24 h.
+    - Processing worker crashes mid-job: the queue redelivers, so make steps idempotent (output keys derived from input key).
+    - Event lost: periodically reconcile PENDING uploads against storage listings.
+    - Egress cost: serving from storage directly costs roughly $0.05–0.09/GB; a CDN with a high hit ratio is cheaper and faster.
+
+    ### What interviewers probe
+    Why bytes bypass the app tier, how resumable uploads work, how you prevent someone from uploading a 50 GB file to a presigned URL (sign a `content-length-range` policy), and where metadata lives.
+  key_points:
+    - "Blobs go in object storage; the database stores only metadata and the object key."
+    - "Clients upload directly with short-lived pre-signed URLs and multipart upload, never through app servers."
+    - "An event-driven pipeline scans and processes uploads asynchronously; items stay PENDING until ready."
+    - "Use immutable keys, lifecycle rules and a CDN in front; object storage first-byte latency is tens of ms."
+  concepts: [object-storage, presigned-url, multipart-upload, erasure-coding]
+
+- slug: video-delivery
+  day: 22
+  title: Transcoding and video delivery
+  minutes: 11
+  summary: "How a raw upload becomes a ladder of small segments that a player switches between, and why the CDN carries almost all the cost and load."
+  plain: |
+    A phone records video in one big, high-quality file. Most viewers cannot stream that: their connection might handle only 2 megabits per second, or their screen is a phone, not a television. So video sites **transcode** every upload — re-encode it into several versions at different resolutions and bitrates (the **bitrate** is how many bits per second of video, which sets both quality and bandwidth). The set of versions, from 240p up to 4K, is called the **bitrate ladder**.
+
+    Each version is then cut into short **segments**, typically 2 to 6 seconds long. A small text file called a **manifest** lists them all. The two standard formats are **HLS** (from Apple) and **MPEG-DASH**.
+
+    The player does the clever part, called **adaptive bitrate streaming (ABR)**. It downloads the manifest, starts with a modest quality, and measures how fast segments arrive. If the network is fast, it fetches the next segment from a higher rung of the ladder; if it slows, it drops down. That is why a video gets blurry for a few seconds in a tunnel instead of stopping.
+
+    Imagine a water company that pre-fills bottles of five sizes and stocks them in corner shops. Each customer grabs the size they can carry, and nobody waits for a tap to be installed. Transcoding fills the bottles once; the **CDN** is the corner shops, holding copies of segments close to viewers so the origin is rarely touched.
+
+    Transcoding is slow and expensive, so it runs as a background job. Long videos are split into chunks and encoded in parallel across many machines, then stitched back together.
+  deeper: |
+    ### A typical ladder (H.264)
+    | Rung | Resolution | Bitrate |
+    |---|---|---|
+    | 240p | 426x240 | ~0.4 Mbps |
+    | 480p | 854x480 | ~1.5 Mbps |
+    | 720p | 1280x720 | ~3–4 Mbps |
+    | 1080p | 1920x1080 | ~5–8 Mbps |
+    | 4K | 3840x2160 | ~15–25 Mbps |
+
+    Newer codecs (VP9, AV1, HEVC) cut bitrate 30–50% at equal quality but cost several times more CPU to encode. Big platforms encode popular videos in AV1 and long-tail videos in H.264 only: encode cost is paid once, egress is paid per view.
+
+    ### Pipeline as a DAG
+    ```
+    upload -> validate -> split into ~10 s chunks -> [encode chunk x rung] in parallel
+           -> stitch -> package HLS/DASH segments + manifests -> thumbnails -> publish
+    ```
+    Chunked parallel encoding turns a 2-hour film from hours of serial work into minutes. Each task is idempotent and keyed by (video, chunk, rung), so retries are safe. Publish 480p first and add higher rungs as they finish, so creators see the video live quickly.
+
+    ### Storage and egress math
+    Commonly cited: about 500 hours of video uploaded to YouTube per minute. That is 30,000 hours/hour. At roughly 5 GB of encoded output per hour of video, summed across every rung of the ladder, that is 150 TB/hour, ~3.6 PB/day of new encoded storage, before replication. Egress dominates cost: 1M concurrent viewers at 5 Mbps is 5 Tbps. That is why the CDN — often with ISP-embedded caches (Netflix Open Connect, Google Global Cache) — is the core of the system, not an add-on.
+
+    ### Segment length trade-off
+    - Short segments (2 s): faster start and quicker adaptation, more requests and manifest churn.
+    - Long segments (6–10 s): better compression and CDN efficiency, slower switching.
+    - Low-latency live (LL-HLS, CMAF chunks) gets glass-to-glass latency to 2–5 s; standard HLS live is 15–30 s.
+
+    ### Popularity is a power law
+    A small share of videos gets most views. Pre-warm CDN caches for predicted hits, let the long tail fall back to a regional shield and then origin, and move cold originals to archive storage.
+
+    ### What interviewers probe
+    How the player picks a rung, why segments make CDN caching work (they are immutable static files), how you resume a failed transcode, and the order-of-magnitude egress bill.
+  key_points:
+    - "Every upload is transcoded into a bitrate ladder and cut into 2–6 s segments listed in an HLS or DASH manifest."
+    - "The player adapts quality per segment based on measured throughput, which is what ABR means."
+    - "Transcoding is a parallel, idempotent DAG of chunk-by-rung tasks run asynchronously."
+    - "Egress dominates cost, so the CDN, including ISP-embedded caches, is the heart of video delivery."
+  concepts: [transcoding, adaptive-bitrate-streaming, hls, bitrate-ladder, cdn]

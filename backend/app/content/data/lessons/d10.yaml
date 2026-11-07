@@ -1,0 +1,167 @@
+- slug: queues-and-async-work
+  day: 10
+  title: Queues and async work
+  minutes: 10
+  summary: A message queue lets you accept work quickly and process it later at a steady pace, decoupling a bursty front end from a slower back end.
+  plain: |
+    At a busy restaurant, the waiter does not stand in the kitchen while your meal cooks. They
+    write the order on a ticket, clip it to the rail, and go serve other tables. Cooks take tickets
+    off the rail in order, as fast as they can. On a rush night the rail gets long, but nobody's
+    order is lost and the waiters keep moving.
+
+    That rail is a **message queue**. The part of your system that creates work is the
+    **producer** (the waiter). It puts a **message** (the ticket) on the queue and immediately moves
+    on. The part that does the work is the **consumer** or **worker** (the cook). It takes messages
+    off the queue and processes them.
+
+    Doing work later instead of while the user waits is called **asynchronous** processing, or
+    **async** for short. It is a good fit when the user does not need the result right away:
+    sending an email, resizing an uploaded photo, recording an analytics event, or writing a burst
+    of orders to the database.
+
+    Three ideas make queues safe:
+
+    - **Acknowledgement**: a worker tells the queue "done" only after it finishes. If it crashes
+      halfway, the message goes back on the queue for another worker.
+    - **Retries and a dead-letter queue**: a message that keeps failing is moved aside to a
+      separate **dead-letter queue** so it does not block everything else, and a human can look at it.
+    - **Backpressure**: if the queue grows faster than workers can drain it, something must push
+      back, by adding workers or by slowing producers down.
+
+    The catch: since a message can be retried, a worker might process it twice. Workers must be
+    written so that doing the same job twice is harmless.
+  deeper: |
+    ### What a queue buys you
+    - **Burst absorption**: accept at enqueue speed (the simulator acks writes in ~2 ms), process at
+      drain speed.
+    - **Decoupling**: producer and consumer deploy, scale and fail independently.
+    - **Load levelling**: the database sees a flat rate instead of the traffic shape.
+
+    ### The arithmetic that matters
+    ```
+    backlog growth  = arrival_rate - drain_rate
+    drain time      = backlog / (drain_rate - arrival_rate)
+    queue lag       = backlog / drain_rate          (age of the oldest message, roughly)
+    ```
+    A queue fed at 6k/s and drained at 4k/s for 60 s holds 120k messages. If arrivals then fall to
+    3k/s, it drains in 120 s. If average arrival exceeds drain rate, no queue size helps; you are only
+    choosing when it fails. In the simulator a partition accepts ~5k msg/s and a backlog over ~2 M
+    starts losing writes.
+
+    ### Delivery semantics
+    | Semantics | Mechanism | Risk |
+    |---|---|---|
+    | At-most-once | ack before processing | crash loses the message |
+    | At-least-once | ack after processing | crash after work, before ack, means a duplicate |
+    | Effectively-once | at-least-once + idempotent consumer | needs a dedupe key or idempotent writes |
+
+    True exactly-once across a queue and an external side effect does not exist without
+    coordination; design consumers to be idempotent: `INSERT ... ON CONFLICT (event_id) DO NOTHING`,
+    or a processed-ids table updated in the same transaction as the effect.
+
+    ### Operational knobs
+    - **Visibility timeout** (SQS) / ack deadline: must exceed p99 processing time, or messages are
+      redelivered while still in progress.
+    - **Retry with backoff**, then a **DLQ** after N attempts; alert on DLQ depth.
+    - **Poison messages**: one malformed message retried forever blocks an ordered queue.
+    - **Scale workers on lag** (age of oldest message), not raw depth, and cap them so they do not
+      overwhelm the database the queue was protecting.
+
+    ### When not to use a queue
+    - The user needs the result in the same request (a search, a payment authorisation).
+    - Strict global ordering at high throughput: queues order per partition or not at all.
+    - To hide a capacity shortfall that is permanent: lag grows until data is lost or too stale.
+
+    Interviewers look for idempotent consumers, a DLQ, lag-based scaling, and a clear statement of
+    what the user sees while work is pending ("upload received, processing").
+  key_points:
+    - "Queues decouple producers from consumers and absorb bursts; the database sees a steady rate."
+    - "Drain time is backlog / (drain rate - arrival rate); if arrivals exceed drain on average, the queue only delays failure."
+    - "Most queues are at-least-once: consumers must be idempotent."
+    - "Use visibility timeouts above p99 processing time, retries with backoff, and a dead-letter queue."
+    - "Scale workers on lag, and cap them to protect downstream systems."
+  concepts: [message-queues, async-processing, at-least-once-delivery, dead-letter-queue, backpressure]
+
+- slug: kafka-and-streams
+  day: 10
+  title: Kafka, pub/sub and streams
+  minutes: 11
+  summary: Kafka is a durable, partitioned log that many independent consumers read at their own pace, giving ordering per key and the ability to replay history.
+  plain: |
+    A regular queue is like a ticket rail: a cook takes a ticket and it is gone. Now imagine instead
+    a **logbook** that the restaurant keeps forever. Every order is written on the next line. The
+    kitchen reads it to cook. The accountant reads the same logbook, at their own pace, to do the
+    books. The manager reads it on Monday to see what sold. Nobody tears out pages. Each reader just
+    remembers which line they got up to.
+
+    That is **Kafka** (and similar systems like Amazon Kinesis and Redpanda). It is a **log**: an
+    ordered, append-only list of messages that is kept for days or weeks.
+
+    Key terms:
+
+    - **Topic**: one named logbook, such as `orders` or `page-views`.
+    - **Partition**: a topic is split into several parallel logbooks so many machines can write and
+      read at once. Messages with the same **key** (for example the same user ID) always go to the
+      same partition, so they stay in order relative to each other.
+    - **Offset**: the line number. Each reader stores its offset, so it can stop, restart, or even
+      go back and re-read old messages. Re-reading is called **replay**.
+    - **Consumer group**: a team of readers sharing the work. Each partition is read by exactly one
+      member of the group at a time.
+
+    This shape is called **publish/subscribe** (pub/sub): a producer publishes once, and any number of
+    independent subscribers each receive every message. Adding a new subscriber, say a fraud
+    detector, does not touch the producer at all.
+
+    Kafka shines when many systems need the same stream of events. For "run this job once in the
+    background", a simple queue is usually easier.
+  deeper: |
+    ### The model
+    ```
+    topic orders, 12 partitions, replication factor 3
+    producer: partition = hash(order.customer_id) % 12
+    group "billing":   6 consumers  -> 2 partitions each
+    group "analytics": 12 consumers -> 1 partition each, independent offsets
+    ```
+    Ordering is guaranteed **within a partition only**. Parallelism within a group is capped at the
+    partition count; a 13th consumer sits idle.
+
+    ### Numbers
+    A single partition commonly sustains on the order of 10 MB/s of writes (tens of thousands of small
+    messages per second with batching); a broker handles hundreds of MB/s. End-to-end latency is
+    single-digit to tens of milliseconds with `linger.ms` batching. Durability comes from
+    `acks=all` with `min.insync.replicas=2` on a replication factor of 3.
+
+    ### Kafka vs a queue
+    | | Kafka / log | SQS / RabbitMQ-style queue |
+    |---|---|---|
+    | Consumption | many groups, each reads everything | competing consumers, message deleted on ack |
+    | Retention | time or size based; replayable | until acked |
+    | Ordering | per partition | none (SQS standard) or per group (FIFO) |
+    | Per-message retry / DLQ | build it yourself (retry topics) | built in |
+    | Scaling unit | partitions, fixed-ish | workers, elastic |
+
+    ### Choosing the key
+    The key decides both ordering and balance. `customer_id` keeps one customer's events ordered;
+    a celebrity customer makes one partition hot. A null key spreads evenly but loses ordering.
+    Adding partitions later changes `hash % N` and breaks per-key ordering across the change.
+
+    ### Failure modes
+    - **Consumer lag** grows when processing is slower than produce rate; it is the primary alert.
+    - **Rebalance storms**: consumers that exceed `max.poll.interval.ms` are kicked out, partitions
+      move, work restarts. Cooperative rebalancing and static membership reduce the churn.
+    - **Duplicates**: committing offsets after processing gives at-least-once. Kafka transactions
+      give exactly-once only for Kafka-to-Kafka pipelines; external side effects still need
+      idempotency.
+    - **Head-of-line blocking**: one slow message stalls its whole partition.
+
+    ### When not to use Kafka
+    Low volume background jobs, per-message delays or priorities, or a team without the operational
+    capacity (or a managed offering). Interviewers look for per-partition ordering, a justified key,
+    consumer groups for fan-out, and replay as a feature (rebuild a read model, backfill a new service).
+  key_points:
+    - "Kafka is a partitioned, replicated, append-only log; consumers track their own offsets and can replay."
+    - "Ordering holds within a partition only; the message key chooses the partition."
+    - "Each consumer group gets every message; within a group, parallelism is capped by partition count."
+    - "Consumer lag is the key health metric; duplicates are normal, so consumers must be idempotent."
+    - "Use a plain queue for simple background jobs; use a log when many consumers or replay are needed."
+  concepts: [kafka, partitioned-log, consumer-groups, consumer-offsets, pub-sub]

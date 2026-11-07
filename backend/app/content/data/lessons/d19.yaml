@@ -1,0 +1,101 @@
+- slug: observability-basics
+  day: 19
+  title: Metrics, logs and traces
+  minutes: 10
+  summary: "The three signals that tell you what a running system is doing, what each is good for, and how to keep them affordable."
+  plain: |
+    **Observability** is how well you can tell what a system is doing from the outside, without adding new code during an outage. It rests on three kinds of signal.
+
+    **Metrics** are numbers counted over time: requests per second, error rate, 99th-percentile latency, CPU. They are cheap to store and perfect for dashboards and alerts. **Logs** are individual event records: "user 42 failed login at 10:03:17, reason: bad password". They carry detail but are bulky. **Traces** follow one request as it hops across services, recording how long each hop took, so you can see that a slow checkout spent 900 ms waiting on the tax service.
+
+    A car is a good analogy. The dashboard gauges (speed, temperature) are metrics: you glance at them constantly and a warning light tells you something is wrong. The mechanic's diagnostic log is the logs: detailed, consulted only when needed. A trace is like a GPS replay of one journey, showing exactly which junction you were stuck at.
+
+    Two simple checklists decide what to measure. For each service, use **RED**: Rate (requests per second), Errors, Duration (latency). For each resource like a disk or database, use **USE**: Utilisation, Saturation (work waiting in a queue), Errors.
+
+    Alerts should fire on what users feel — error rate and latency against your service level objective — not on every CPU spike. An alert that wakes someone up must be something they can act on.
+  deeper: |
+    ### Metrics: cardinality is the bill
+    A time series is one metric plus one unique set of labels. `http_requests{route, status, region}` with 50 routes x 6 statuses x 5 regions = 1,500 series: fine. Add `user_id` with 10M values and you have 15 billion series: your Prometheus falls over. Rule: labels have bounded, small value sets. Put per-user detail in logs or traces.
+
+    ### Percentiles do not average
+    You cannot average p99s from 20 hosts to get the fleet p99. Export **histograms** (bucket counts) and compute quantiles over the merged buckets, or use mergeable sketches (t-digest, HDR, DDSketch). Interviewers like this one.
+
+    ### Logs: structure and volume
+    - Emit structured JSON with a `trace_id` on every line so logs join traces.
+    - Volume adds up: 50k rps x 1 KB per request log = 50 MB/s = ~4.3 TB/day. At typical managed-log prices that is a five- to six-figure monthly bill. Sample success logs (1%), keep all errors.
+
+    ### Traces: sampling choices
+    | | Head sampling | Tail sampling |
+    |---|---|---|
+    | Decision | at request start (keep 1%) | after the request finishes |
+    | Keeps slow/error traces | only by luck | yes, deliberately |
+    | Cost | cheap | collectors must buffer whole traces for seconds |
+
+    Propagate context with the W3C `traceparent` header; OpenTelemetry is the default instrumentation standard.
+
+    ### Alerting that works
+    - Alert on SLO **burn rate**: e.g. page if the 1-hour burn rate exceeds 14.4x (2% of a 30-day budget in an hour), ticket at lower rates over 6 hours.
+    - Symptoms page, causes go on dashboards. "DB CPU 85%" is a dashboard; "checkout p99 > 1 s for 5 minutes" is a page.
+    - Every page links a runbook.
+
+    ### Failure modes
+    Monitoring that shares fate with the system (same cluster, same region) dies with it. Keep at least a minimal external probe and meta-monitoring of the pipeline. Watch for silent gaps: a metric that stops reporting should alert, not read as zero.
+  key_points:
+    - "Metrics for alerting and trends, logs for detail, traces for where time went across services."
+    - "RED (rate, errors, duration) per service; USE (utilisation, saturation, errors) per resource."
+    - "Label cardinality drives metrics cost; never use user IDs as labels."
+    - "Merge histograms, never average percentiles; tail sampling keeps the slow and failed traces you actually need."
+  concepts: [observability, red-method, use-method, distributed-tracing, metric-cardinality]
+
+- slug: stream-processing-and-sketches
+  day: 19
+  title: Stream processing and probabilistic sketches
+  minutes: 12
+  summary: "How to compute rolling counts and top-K over an endless event stream using windows, watermarks and tiny approximate data structures."
+  plain: |
+    **Batch processing** works on a finished pile of data: yesterday's logs, crunched overnight. **Stream processing** works on data that never stops arriving — clicks, searches, payments — and keeps answers up to date within seconds.
+
+    Because a stream never ends, you can only ask questions about slices of it called **windows**. A **tumbling window** is back-to-back, non-overlapping buckets: every minute, count the searches. A **sliding window** asks "the last 5 minutes, recomputed every 10 seconds". Events also arrive late — a phone was offline and uploads its clicks a minute later — so stream engines track a **watermark**, a running estimate of "I have probably seen everything up to 10:04", and decide what to do with stragglers.
+
+    Exact answers can be too expensive. Counting how often each of a billion distinct hashtags appears needs a counter per hashtag. **Sketches** are small data structures that give approximate answers using fixed, tiny memory.
+
+    A **count-min sketch** is like a few rows of tally boxes. Each hashtag is hashed to one box in every row, and you add one to each. To ask "how many times did #final appear?" you read its boxes and take the smallest. Collisions can only push counts up, never down, so the answer is never too low and is usually close. A **HyperLogLog** answers "how many *different* users?" using about 12 KB, whether there are a thousand or a billion.
+
+    Combine a count-min sketch with a small leaderboard of the current biggest items and you have **top-K trending** for the price of a few megabytes.
+  deeper: |
+    ### Count-min sketch sizing
+    Width `w = ceil(e / epsilon)`, depth `d = ceil(ln(1 / delta))`. The estimate exceeds the true count by more than `epsilon x N` (N = total events) with probability at most `delta`.
+
+    | epsilon | delta | w | d | 4-byte counters |
+    |---|---|---|---|---|
+    | 0.001 | 0.01 | 2,719 | 5 | ~54 KB |
+    | 0.0001 | 0.001 | 27,183 | 7 | ~760 KB |
+
+    Error is relative to **total** volume, so it is accurate for heavy hitters and useless for rare items — exactly what top-K needs. Pair it with a min-heap of size K: on each event, update the sketch, read the estimate, and push into the heap if it beats the minimum. Space-Saving and Misra-Gries are deterministic alternatives with similar guarantees.
+
+    ### HyperLogLog
+    Redis's HLL uses 16,384 registers in 12 KB with 0.81% standard error. HLLs merge by taking register-wise maxima, so per-minute HLLs roll up into hourly unique counts — something exact sets cannot do cheaply.
+
+    ### Windows and watermarks
+    ```
+    events -> Kafka (partitioned by key) -> Flink: keyBy(hashtag)
+           -> window(sliding 5 min, slide 10 s) -> aggregate -> top-K -> Redis -> API
+    ```
+    - Sliding windows multiply state: a 5-minute window sliding every 10 s keeps 30 overlapping panes. Implement as 10-second tumbling buckets and sum the last 30.
+    - Allowed lateness (say 1 minute) keeps windows open for stragglers; events beyond it go to a side output or are dropped. Say which.
+    - State is checkpointed (Flink to S3 every 10–60 s) so a failed task resumes without double counting inside the pipeline.
+
+    ### Scale and hot keys
+    One million events/s partitioned by hashtag puts a viral tag on one partition. Do two-stage aggregation: pre-aggregate locally per partition for 1–5 s, then merge partial counts in a global top-K stage. Same idea as a combiner in MapReduce.
+
+    ### Lambda vs Kappa
+    Lambda runs a streaming path for fresh approximate results and a batch path for exact recomputation; two codebases. Kappa keeps one streaming codebase and replays the log to recompute. Most modern stacks lean Kappa; interviewers accept either if you name the trade-off.
+
+    ### When not to use sketches
+    Billing, quotas and anything audited need exact counts. Sketches are for trending, analytics and dashboards.
+  key_points:
+    - "Streams are queried through windows; watermarks and allowed lateness decide how late events are handled."
+    - "Count-min sketch gives over-estimates bounded by epsilon times total volume in kilobytes; pair it with a size-K heap for top-K."
+    - "HyperLogLog counts distinct items in 12 KB at under 1% error, and merges across time buckets."
+    - "Hot keys in streams need two-stage aggregation; sketches are never for billing or audited counts."
+  concepts: [stream-processing, windowing, watermark, count-min-sketch, hyperloglog]

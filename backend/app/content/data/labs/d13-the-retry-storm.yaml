@@ -1,0 +1,206 @@
+slug: the-retry-storm
+kind: lab
+title: The retry storm
+difficulty: hard
+day: 13
+checkpoint: true
+summary: A 15-second marketing push overloads the database, and the API's 10-second timeouts and triple retries turn it into a full outage. Contain the failure instead of amplifying it.
+topics: [timeouts, retries, circuit-breaker, metastable-failure, failure-containment, littles-law]
+company_tags: [Amazon, Netflix, Uber]
+estimated_minutes: 35
+incident: "SEV-1 · 60% of all requests 503 at 19:00 · API in-flight limit reached · p99 10 s · orders-db 100%"
+
+brief_beginner: |
+  You run **Hearthly**, an app for booking plumbers and electricians. About **3,400 requests per
+  second** hit your API. Almost all of them are cheap: 95% read pages that are already in Redis.
+  A small share (about 1 in 9) must touch the **orders database**, which is small and runs at
+  80% busy on a normal evening.
+
+  At 19:00 marketing sent a push notification to every user. For **15 seconds** traffic was
+  **2.6×** normal. The database could not keep up with its share, which is expected. What was
+  not expected: the whole app went down, including the pages that never touch the database, and
+  latency hit 10 seconds.
+
+  Two settings on the API made it worse:
+  - **Timeout** = how long the API waits for the database before giving up. Yours is 10 seconds.
+    While a request waits, it occupies one of the API's worker threads, and there are only so many.
+  - **Retries** = how many times the API tries again after a failure. Yours is 3, so one failed
+    call can become four calls, landing on a database that is already drowning.
+
+  A **circuit breaker** is the third tool: when most calls to the database are failing, stop
+  calling it for a few seconds and fail fast instead. The database gets room to recover, and the
+  API stays free to serve everything else.
+
+  You cannot buy a bigger database (budget). You can change how the API behaves when it is in
+  trouble.
+
+  **Your job:** keep the app fast while the push overloads the database, and make sure everything
+  is healthy again soon after the push ends.
+
+brief_expert: |
+  3,400 rps (95% reads, 95% cacheable, ~98% hit ratio), so ~11% of requests are DB-bound.
+  orders-db (PostgreSQL small, ~600 units/s) at ~80% busy. A push drives traffic to 2.6× for 15 s
+  (ramp 2 s): DB-bound load reaches ~2× capacity. API: 12 × large (3,072 threads, ~30% CPU),
+  `timeout_ms = 10000`, `retries = 3`, no circuit breaker.
+
+  The database *will* shed work during the push; the goal is to keep that from spreading. Apply
+  Little's law to the thread pool (in-flight = rate × time held), bound the time a request can
+  hold a thread, stop retry amplification on a dependency that is rejecting work, and give the
+  database a way to drain its queue once the trigger is gone (the recovery tail is where most of
+  the damage happens). A larger database does not fit the budget.
+
+glossary:
+  - term: Timeout
+    meaning: The longest the API waits for a dependency before giving up. It bounds latency, and how long a thread is tied up.
+  - term: Retry amplification
+    meaning: Retrying failed calls multiplies the load on the thing that is failing. 3 retries can mean 4× the traffic.
+  - term: Circuit breaker
+    meaning: After too many failures, stop calling a dependency for a short time and fail immediately, so it can recover.
+  - term: Metastable failure
+    meaning: An overload that keeps itself going after its trigger is gone, because the system's own reaction (queues, retries) sustains it.
+  - term: Little's law
+    meaning: Requests in flight = arrival rate × time each one takes. 8,000 req/s held for 1 s = 8,000 threads busy.
+
+requirements:
+  - During and after the push, p99 latency under 80 ms
+  - Error rate under 5.8% over the run (the database cannot serve its share during the push; the rest of the app must)
+  - Stay within $2.30/hr (a bigger orders database does not fit)
+
+budget: 2.3
+palette: [load_balancer, app_server, cache, database]
+
+starter:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Hearthly API, config: {size: large, instances: 12, timeout_ms: 10000, retries: 3, circuit_breaker: false}, position: {x: 480, y: 160}}
+    - {id: redis, type: cache, label: Redis, config: {memory_gb: "4", ttl_s: 600}, position: {x: 720, y: 40}}
+    - {id: db, type: database, label: orders-db, config: {size: small}, position: {x: 720, y: 280}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: redis}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Hearthly API, config: {size: large, instances: 12, timeout_ms: 300, retries: 1, circuit_breaker: true}, position: {x: 480, y: 160}}
+    - {id: redis, type: cache, label: Redis, config: {memory_gb: "4", ttl_s: 600}, position: {x: 720, y: 40}}
+    - {id: db, type: database, label: orders-db, config: {size: small}, position: {x: 720, y: 280}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: redis}
+    - {source: api, target: db}
+
+tests:
+  - id: push
+    name: The 19:00 push notification
+    summary: 3,400 req/s; 2.6× for 15 s
+    scenario:
+      duration: 90
+      base_rps: 3400
+      read_ratio: 0.95
+      cacheable: 0.95
+      working_set_gb: 2
+      spikes: [{at: 20, duration: 15, multiplier: 2.6, ramp: 2}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 80}
+      - {metric: error_rate, op: lte, value: 5.8}
+  - id: double-push
+    name: Marketing sends a reminder
+    summary: Two 10 s pushes, 30 s apart
+    hidden: true
+    scenario:
+      duration: 120
+      base_rps: 3400
+      read_ratio: 0.95
+      cacheable: 0.95
+      working_set_gb: 2
+      spikes:
+        - {at: 20, duration: 10, multiplier: 2.6, ramp: 2}
+        - {at: 50, duration: 10, multiplier: 2.6, ramp: 2}
+    assertions:
+      - {metric: p99_ms, op: lte, value: 80}
+      - {metric: error_rate, op: lte, value: 6.5}
+  - id: long-push
+    name: A push that goes viral
+    summary: 2.6× for 30 s
+    hidden: true
+    scenario:
+      duration: 120
+      base_rps: 3400
+      read_ratio: 0.95
+      cacheable: 0.95
+      working_set_gb: 2
+      spikes: [{at: 20, duration: 30, multiplier: 2.6, ramp: 2}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 85}
+      - {metric: error_rate, op: lte, value: 8.5}
+
+hints:
+  - Run the test and read the failure reasons. The database is overloaded, but the errors come from the API itself. Why would the API refuse a request that only needed Redis?
+  - "Little's law: threads in use = requests per second × seconds each request holds a thread. At ~8,800 req/s, how long can a request wait on the database before the API runs out of its 3,072 threads?"
+  - "Bring the timeout down to a few hundred milliseconds (under ~350 ms at the peak rate), drop retries to 0 or 1, and turn on the circuit breaker. Then compare how long errors last after the push ends with and without the breaker: that tail is the metastable part."
+
+editorial: |
+  ### Why it broke
+  orders-db can do ~600 units/s and normally runs at ~480. The push sends it ~1,250. That part is
+  unavoidable: for a few seconds the database queues and then rejects work.
+
+  What turned it into an outage is the API. Each request that reaches the database can hold a
+  thread for up to **10 s**, and up to 4 attempts. By Little's law, ~8,800 req/s with even 1 s of
+  waiting needs ~8,800 threads; the fleet has **3,072**. The API hits its in-flight limit and
+  starts rejecting *everything*, including the 89% of requests that only needed Redis. From
+  t=24 to t=35 **50–63% of all requests fail**, p99 sits near **10 s**, and the tail stays above
+  1 s for another 8 s. Overall: **15.4% errors, p99 5.4 s**.
+
+  ### Step 1: a timeout is a thread budget
+  At 300 ms, in-flight at the peak is ~8,840 × 0.31 s ≈ **2,740 threads**: under 3,072, so the
+  API never saturates and cache hits keep flowing. DB-bound requests that cannot be served now
+  fail in 300 ms instead of hanging. (500 ms looks "safer" but needs ~4,400 threads: the API
+  falls over again, ~13% errors.)
+
+  ### Step 2: the metastable tail
+  With only the timeout fixed, watch what happens after the push. At t=26 the database's queue
+  is full (5 s of work) and it starts rejecting. With 3 retries, every rejection comes back: at a
+  55% rejection rate the database receives 1 + 0.55 + 0.30 + 0.17 = **2.0×** the traffic, which
+  pushes rejections to **85%** and the multiplier to **3.2×**. The push ends at t=37, yet the
+  database stays saturated until t=40, and then spends until **t=64** chewing through a full queue
+  of requests whose callers timed out long ago. **27 seconds of errors after traffic was back to
+  normal**: the overload outlived its trigger. Result: 6.9% errors.
+
+  ```
+  trigger ──▶ DB queue fills ──▶ timeouts + rejections ──▶ retries add load ──┐
+                  ▲                                                          │
+                  └──────────────────── keeps the queue full ◀───────────────┘
+  ```
+
+  ### Step 3: a circuit breaker breaks the loop
+  When more than half of the calls fail, the breaker opens for 5 s: the API fails DB-bound
+  requests instantly and sends only ~10% of them as probes. The database drains its queue
+  (3,000 → ~1,100 units in 4 s), the breaker closes, opens once more at t=35, and the backlog is
+  gone by **t=46** instead of t=64. With retries at 1 the amplification is capped at 2× even
+  before the breaker trips. Result: **4.96% errors, p99 62 ms**, all of them fast, all of them on
+  the ~11% of requests that genuinely needed the overloaded database.
+
+  ### The trap the hidden tests probe
+  A second push 30 s later lands while the database is still draining the first one. Without a
+  breaker the two tails merge (7.5% errors); with it, each push is contained (5.6%). A longer,
+  30 s push checks that the fix holds while the overload is sustained, not just for a blip.
+
+  ### Alternatives and why not
+  - **Bigger database**: the honest long-term fix for capacity, but it is over budget, and it only
+    moves the threshold. The next push that exceeds it brings the same outage back unless the API
+    fails gracefully.
+  - **More API instances** to get more threads: you would need ~3× the fleet to hold 10 s waits,
+    all of it parked on a database that cannot answer.
+  - **Exponential backoff with jitter**: the right way to retry (and what you should use for the
+    one retry you keep). It spreads retries out but does not remove the load; a breaker does.
+
+  ### Interview takeaway
+  Set timeouts from the dependency's latency SLO and your thread budget (Little's law), retry at
+  most once with backoff and jitter, put a circuit breaker on every remote dependency, and look
+  for feedback loops that keep an overload alive after the trigger is gone.

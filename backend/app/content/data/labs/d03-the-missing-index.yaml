@@ -1,0 +1,135 @@
+slug: the-missing-index
+kind: lab
+title: The missing index
+difficulty: easy
+day: 3
+summary: Every login looks a user up by email, and nobody indexed the email column. Add the index instead of buying a bigger database.
+topics: [databases, indexes, query-plans, sql]
+company_tags: [Stripe, Atlassian]
+estimated_minutes: 15
+incident: "SEV-1 · logins failing on Tallyhub · PostgreSQL CPU 100% · seq scan on users.email"
+
+brief_beginner: |
+  You run **Tallyhub**, an expense-tracking app for small teams. When someone signs in, the API asks
+  the database: *"find the user whose email is `sam@example.com`"*. About **800 requests per second**
+  hit the API, and most of them involve that lookup.
+
+  The problem: the `users` table is sorted by user **id**, not by **email**. To find one email, the
+  database has to read through the table row by row until it finds a match. Each lookup is about
+  **15 times** more work than it should be. The database falls hopelessly behind, and nobody can
+  sign in.
+
+  Picture a phone book printed in the order people signed up instead of alphabetically. Finding
+  "Sam" means reading every page. An **index** is the alphabetical version: a separate, sorted list
+  that tells the database exactly where each email lives.
+
+  **Your job:** make the email lookup cheap again so logins work, without paying for a much bigger
+  database.
+
+brief_expert: |
+  800 rps, 85% reads dominated by `SELECT … FROM users WHERE email = $1`. Only `id` is indexed, so each
+  lookup is a sequential scan (~15× the cost of an index probe, ~45 ms base latency). PostgreSQL
+  (medium, ~1.5k indexed qps) is asked for ~10k units/s. API threads pile up behind it and the
+  whole service returns 5xx.
+
+  A B-tree index on the filter column turns each read into a point lookup. Check the post-fix headroom:
+  login traffic is bursty (Monday morning, password-reset emails). Larger instances or replicas on an
+  unindexed column cost 2–3× the budget and still burn CPU on scans.
+
+glossary:
+  - term: Index
+    meaning: A sorted lookup structure for one column. It lets the database jump straight to matching rows instead of reading the whole table.
+  - term: Full table scan
+    meaning: Reading every row of a table to find the ones that match. Fine for 100 rows, terrible for millions.
+  - term: Query
+    meaning: A question you ask the database, such as "find the user with this email".
+  - term: B-tree
+    meaning: The most common kind of database index. It keeps values sorted so a lookup takes a handful of steps even on huge tables.
+
+requirements:
+  - p99 latency under 70 ms at 800 req/s
+  - Error rate under 0.2%
+  - Stay within $0.60/hr (a larger database does not fit)
+
+budget: 0.60
+palette: [load_balancer, app_server, database]
+
+starter:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 120}}
+    - {id: lb, type: load_balancer, label: Load Balancer, position: {x: 240, y: 120}}
+    - {id: api, type: app_server, label: Tallyhub API, config: {size: medium, instances: 3}, position: {x: 480, y: 120}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: medium, indexes: "id"}, position: {x: 720, y: 120}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 120}}
+    - {id: lb, type: load_balancer, label: Load Balancer, position: {x: 240, y: 120}}
+    - {id: api, type: app_server, label: Tallyhub API, config: {size: medium, instances: 3}, position: {x: 480, y: 120}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: medium, indexes: "id, email"}, position: {x: 720, y: 120}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: db}
+
+tests:
+  - id: normal
+    name: Normal sign-in traffic
+    summary: 800 req/s, 85% email lookups
+    scenario: {base_rps: 800, read_ratio: 0.85, query_column: email}
+    assertions:
+      - {metric: p99_ms, op: lte, value: 70}
+      - {metric: error_rate, op: lte, value: 0.2}
+  - id: monday-rush
+    name: Monday 9 am
+    summary: Everyone signs in at once, traffic up 40% for 20 seconds
+    hidden: true
+    scenario:
+      base_rps: 800
+      read_ratio: 0.85
+      query_column: email
+      spikes: [{at: 20, duration: 20, multiplier: 1.4, ramp: 5}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 115}
+      - {metric: error_rate, op: lte, value: 0.5}
+
+hints:
+  - Run the test. The API is reporting errors, but its CPU is fine. Follow the arrows to the box that is actually overloaded.
+  - Open the database settings and compare the column the hot query filters on (the incident line names it) with the list of indexed columns.
+  - Add `email` to the database's indexed columns (for example `id, email`). Each lookup goes from a full scan to a single probe. Then check how much headroom is left for a Monday morning rush.
+
+editorial: |
+  ### Why it broke
+  The hot query filters on `email`, but only `id` is indexed. Without an index PostgreSQL scans the
+  table, which in this simulator costs **15×** an indexed lookup and takes ~45 ms instead of ~3 ms.
+  About **680 reads/s × 15 = 10,200 units/s**, plus writes, against a medium database that does
+  **1,500**. That is nearly **7×** over capacity. API threads sit waiting on the database until they
+  run out, so the API refuses requests too. In the starter run **every request fails**.
+
+  ### The fix: index the filter column
+  ```sql
+  CREATE INDEX CONCURRENTLY users_email_idx ON users (email);
+  ```
+  Each login becomes a B-tree probe: a few page reads instead of the whole table. The database now
+  does about **680 reads + 180 write units ≈ 860 units/s**, around **57%** busy. p99 drops to about
+  **57 ms** with no errors, and the bill stays at **$0.50/hr**. (`CONCURRENTLY` builds the index
+  without locking writes, which matters on a live table.)
+
+  ### The trap: headroom for bursts
+  The hidden test is a Monday-morning rush: 40% more sign-ins for 20 seconds. The database peaks near
+  80% busy and p99 rises to about 98 ms, still inside the limit. Had you also shrunk the database to
+  save money, this is where it would fall over.
+
+  ### Why not a bigger database?
+  An xlarge database (8k qps) still loses against 10k units/s of table scans, and costs more than the
+  whole budget. Adding replicas spreads the scans but multiplies the cost and still wastes CPU on
+  reading rows you throw away. Indexes are not free either: each one slows writes slightly and uses
+  disk, so index the columns your hot queries filter or join on, not every column.
+
+  ### Interview takeaway
+  When a database is slow, look at the query plan before the instance size. A missing index turns an
+  O(log n) lookup into O(n), and no amount of hardware keeps up with that as the table grows.

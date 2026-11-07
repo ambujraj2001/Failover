@@ -1,0 +1,102 @@
+- slug: multi-region-architecture
+  day: 18
+  title: Multi-region architecture
+  minutes: 11
+  summary: "Why you run in more than one region, how traffic finds the nearest one, and what active-active really costs in latency and conflicts."
+  plain: |
+    A **region** is a cluster of data centres in one geographic area, such as Virginia or Frankfurt. Running in several regions buys two things: users get answers from somewhere close, and the product survives a whole region going dark.
+
+    Think of a bakery chain. With one shop, customers across the country wait days for delivery, and a fire closes the business. With shops in five cities, everyone is near one, and a fire closes one shop while the others keep selling. But now the shops must agree on things: if a customer's loyalty points are spent in Leeds, the Bristol shop needs to know before they are spent again.
+
+    **Geo routing** sends each user to a nearby region. **GeoDNS** answers the same name with different addresses depending on where the request comes from. **Anycast** advertises one IP address from many places and lets internet routing deliver packets to the closest.
+
+    There are two main layouts. **Active-passive**: one region takes all writes and a standby region copies the data, ready to take over. Simple, but failover takes minutes and the standby is mostly idle. **Active-active**: every region takes reads and writes. Users everywhere get fast writes, but two regions can change the same record at the same moment, and something has to decide which change wins — a **conflict**.
+
+    The speed of light sets the floor. Light in fibre covers about 200 km per millisecond, so a round trip between New York and London is never faster than about 55 ms, and in practice is closer to 70–80 ms.
+  deeper: |
+    ### Latency floor you should quote
+    | Path | Typical RTT |
+    |---|---|
+    | Same AZ | < 1 ms |
+    | Cross-AZ, same region | 1–2 ms |
+    | US East to US West | 60–70 ms |
+    | US East to Western Europe | 75–90 ms |
+    | US to East Asia | 140–200 ms |
+
+    Any design that needs a synchronous cross-region round trip on the write path pays these numbers on every write.
+
+    ### Three patterns, in order of difficulty
+    1. **Active-passive with async replication.** RPO = replication lag (seconds), RTO = detection + promotion + DNS TTL (often 1–10 minutes). Cheapest and the right default for most products.
+    2. **Active-active with home regions.** Each user (or tenant, or document) has one home region that owns its writes; other regions serve reads and forward writes. No write conflicts, local writes for most users. Travelling users pay one cross-region hop.
+    3. **Active-active multi-writer.** Any region writes any record. Needs a conflict strategy:
+       - Last-writer-wins on timestamps: simple, silently drops data under clock skew.
+       - CRDTs (counters, sets): correct merges for the types they cover.
+       - Consensus across regions (Spanner, CockroachDB): no conflicts, but each write costs a cross-region quorum, 50–150 ms.
+
+    ### Failure modes
+    - **Split brain**: both regions think they are primary after a partition. Require a quorum (three regions, or a witness) before promoting.
+    - **Failover capacity**: if each of two regions runs at 70%, losing one sends 140% to the survivor. Run N regions at most (N-1)/N utilisation, or have autoscaling headroom.
+    - **DNS caching**: clients ignore low TTLs; budget minutes, or use anycast / a global load balancer for faster steering.
+    - **Global dependencies**: a single-region auth service or config store makes your five regions one region. Audit for them.
+
+    ### When not to go multi-region
+    If the requirement is 99.9% and users are on one continent, multi-AZ in one region is usually enough and far cheaper. Cross-region data transfer is billed (often about $0.02/GB) and doubles your operational surface.
+
+    ### What interviewers probe
+    "What is your RPO during a region loss?" "How do you avoid a user seeing their own write disappear after being routed to another region?" (pin sessions to a home region, or carry a write version and read from a replica that has caught up).
+  key_points:
+    - "Light in fibre costs about 1 ms per 100 km of round trip; cross-continent synchronous writes cost 70–200 ms."
+    - "Active-passive is the sane default; active-active with a home region per user avoids most conflicts."
+    - "Multi-writer active-active needs a conflict strategy: LWW loses data, CRDTs merge some types, consensus costs latency."
+    - "Survivors must absorb the failed region's load, and any single-region dependency undoes the whole design."
+  concepts: [multi-region, active-active, geo-dns, anycast, last-writer-wins]
+
+- slug: push-at-scale
+  day: 18
+  title: Push at scale and hot streams
+  minutes: 10
+  summary: "How to push live updates to millions of open connections with SSE or WebSockets, and how to fan out a single viral stream without melting."
+  plain: |
+    Most web traffic is **pull**: the browser asks, the server answers. Live comments, scores and notifications need **push**: the server sends news the moment it happens.
+
+    There are three common ways to push to a browser. **Long polling**: the browser asks "anything new?" and the server holds the request open until there is, then the browser asks again. **Server-Sent Events (SSE)**: one long-lived HTTP response that the server keeps writing lines into; one-way, server to browser, with automatic reconnect built in. **WebSockets**: a two-way channel opened by upgrading an HTTP connection; best when the client also sends a steady stream of messages.
+
+    For live comments on a video, SSE is usually enough: viewers mostly receive, and the rare comment they post can be a normal HTTP request.
+
+    The hard part is **fan-out**: one comment must reach every viewer. Picture a stadium announcer. Shouting to 80,000 people one by one is impossible, so the stadium uses a speaker system: the announcer speaks once, it goes to a few amplifiers, and each amplifier drives the speakers in its section. Push systems work the same way. A comment is published once to a **pub/sub channel** for that video. Each **gateway server** (the machines holding viewer connections) subscribes once to the channel and then writes the comment to all of its own viewers.
+
+    A **hot stream** is a single broadcast with an enormous audience, like a final or a celebrity launch. It is the push version of a hot key, and it needs its own plan.
+  deeper: |
+    ### Connection economics
+    - A tuned Linux gateway (epoll, Go/Netty/Erlang) holds 100k–1M idle connections; plan around 100k–250k per box to leave CPU for fan-out. Memory is roughly 10–50 KB per connection with TLS buffers.
+    - 10M concurrent viewers / 200k per gateway = 50 gateways, before headroom.
+    - Each connection needs a heartbeat (every 15–30 s) to beat idle timeouts on load balancers and NATs. That alone is 10M / 20 s = 500k tiny messages/s.
+
+    ### Fan-out topology
+    ```
+    poster -> comment API -> pub/sub (channel per video)
+                                 |  one subscription per gateway, not per viewer
+                         gateway 1 ... gateway N -> local viewers
+    ```
+    The pub/sub layer sees N gateway subscriptions, not millions of viewers. Gateways should subscribe only to channels their viewers watch; route viewers of the same video to the same subset of gateways (consistent hashing on video id) so a long-tail video does not cost a subscription on every gateway.
+
+    ### Hot streams
+    1M viewers, 2,000 comments/s posted. Delivering every comment means 2 billion deliveries/s and a feed no human can read. Fixes:
+    - **Sample**: show each viewer at most ~10–20 comments/s; prioritise friends, verified accounts, replies.
+    - **Batch**: flush every 200–500 ms as one frame instead of one frame per comment.
+    - **Tree fan-out**: regional relays subscribe to the origin, gateways subscribe to relays.
+    - **Aggregate**: reactions become counters ("12.4k likes"), not individual events.
+
+    ### Failure modes
+    - **Reconnect storm**: a gateway deploy drops 200k connections that all reconnect in the same second. Use jittered backoff on the client and drain gateways gradually.
+    - **Slow consumers**: a viewer on a bad connection must not block the write loop; use bounded per-connection buffers and drop or disconnect.
+    - **Missed messages**: SSE `Last-Event-ID` lets clients resume; for live comments, gaps are acceptable and you should say so.
+
+    ### When not to push
+    If updates every 30–60 s are fine (dashboards, order status), plain polling with CDN caching is cheaper and simpler.
+  key_points:
+    - "SSE suits mostly-receive feeds like live comments; WebSockets suit two-way chatty clients; long polling is the fallback."
+    - "Publish once per channel; gateways subscribe once and fan out locally, so pub/sub load scales with gateways, not viewers."
+    - "Hot streams need sampling, batching and aggregation; delivering every event to every viewer is neither possible nor useful."
+    - "Plan for reconnect storms with client jitter and gradual gateway drains."
+  concepts: [server-sent-events, websockets, pub-sub, fan-out, hot-stream]

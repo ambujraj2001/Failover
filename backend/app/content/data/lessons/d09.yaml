@@ -1,0 +1,162 @@
+- slug: cache-stampedes
+  day: 9
+  title: Cache stampedes and hot keys
+  minutes: 10
+  summary: When a popular cached item expires or the cache empties, thousands of requests miss at once and hit the database together, unless you coalesce, stagger or refresh early.
+  plain: |
+    A bakery keeps one tray of its famous croissants on the counter. Every customer takes one from
+    the tray. When the tray empties, the baker needs ten minutes to bake more. Now imagine 500
+    customers arrive in those ten minutes, and *each one* walks into the kitchen and asks the baker
+    to bake a fresh tray just for them. The kitchen grinds to a halt.
+
+    That is a **cache stampede** (also called a **thundering herd**). A popular item sits in the
+    cache. Its **TTL** (time to live) runs out, or the cache restarts. The next request misses and
+    goes to the database. But so do the hundreds of other requests that arrive in the same
+    millisecond, all asking the database for the exact same thing. The database, which was
+    comfortable a second ago, is suddenly flooded.
+
+    It gets worse when many items expire together. If you cached everything at 9:00 with a one-hour
+    TTL, everything expires at 10:00 together.
+
+    Fixes, in plain terms:
+
+    - **Only one baker per tray.** The first request that misses fetches from the database; the
+      others wait a moment for its answer. This is called **request coalescing**.
+    - **Stagger the expiry.** Add a small random amount to each TTL, called **jitter**, so items do
+      not all expire at the same second.
+    - **Bake before the tray is empty.** Refresh popular items shortly *before* they expire.
+    - **Fill the tray before opening.** After a restart, load popular items before sending traffic.
+      This is **cache warming**.
+
+    A related problem is a **hot key**: one item so popular that a single cache server cannot keep
+    up with requests for it, even when nothing expires.
+  deeper: |
+    ### Why it is worse than it looks
+    A key receiving 20k rps with a 50 ms database refill sees `20,000 x 0.05 = 1,000` requests miss
+    during the refill window, all issuing the same query. With a mass expiry, the miss rate jumps from 2% to ~85% instantly
+    (the simulator's `ttl_expiry_wave` drops hit ratio to 15%). The DB saturates, the refill queries
+    themselves slow down, the window widens, and the stampede feeds itself.
+
+    ### Defences
+    | Technique | How | Trade-off |
+    |---|---|---|
+    | Request coalescing | in-process `singleflight` per key; one fetch per key per instance | still N fetches for N instances |
+    | Distributed lock | `SET lock:k 1 NX PX 5000`; losers wait or serve stale | lock holder crash delays refill until the lock expires |
+    | Stale-while-revalidate | keep serving the old value while one request refreshes | bounded extra staleness |
+    | Probabilistic early refresh (XFetch) | refresh with probability rising as expiry nears | slightly more DB reads, no herd |
+    | TTL jitter | `ttl = base * uniform(0.9, 1.1)` | spreads expiry, does not help a single hot key |
+    | Warming | preload top-N keys before taking traffic | needs a known hot set |
+
+    The XFetch rule refreshes early when:
+    ```
+    now - delta * beta * ln(rand()) >= expiry      # delta = recompute time, beta ≈ 1
+    ```
+    In the simulator, `stampede_protection` cuts miss traffic to the database by up to 75% while
+    the cache is cold.
+
+    ### Cold cache after failure
+    A flushed or replaced cache node is a stampede across every key at once. Protect the database
+    with coalescing plus a concurrency limit on miss traffic (a semaphore per instance), serve
+    stale or degraded responses, and warm before rejoining.
+
+    ### Hot keys
+    One Redis node handles ~80k ops/s in the simulator (100k+ in practice) and a key lives on
+    exactly one node. A key at 300k rps exceeds any single node. Options:
+    - **Local in-process cache** with a 1 to 5 s TTL in front of Redis: removes most hot-key traffic.
+    - **Key replication**: store `k#0..k#9`, read a random suffix, write all.
+    - **Read replicas** for the cache cluster.
+    Detect them with `redis-cli --hotkeys` (LFU policy required) or client-side sampling.
+
+    ### What interviewers probe
+    "Your cache restarts at peak. What happens?" Strong answers name the herd, compute the miss
+    load against DB capacity, and layer coalescing, jitter, stale serving and warming. For hot keys
+    they want local caching or key splitting, not "add more Redis nodes", which does not help a
+    single key.
+  key_points:
+    - "A stampede is many simultaneous misses for the same key, triggered by expiry, a flush or a restart."
+    - "Coalesce misses so one request per key refills the cache; serve stale while it does."
+    - "Add TTL jitter so keys do not expire together, and refresh hot keys before they expire."
+    - "Warm the cache before taking traffic after a restart or failover."
+    - "A hot key is bounded by one cache node; fix it with local caching or key replication."
+  concepts: [cache-stampede, request-coalescing, ttl-jitter, cache-warming, hot-keys]
+
+- slug: eviction-and-sizing
+  day: 9
+  title: Eviction policies and cache sizing
+  minutes: 9
+  summary: A cache is smaller than the data behind it, so it must decide what to throw away, and sizing it to the working set decides the hit ratio.
+  plain: |
+    Your fridge is smaller than the supermarket. When it is full and you bring home new groceries,
+    something has to come out. Which thing? That decision is an **eviction policy**.
+
+    Common policies:
+
+    - **LRU, least recently used**: throw out whatever you have not touched for the longest. The
+      jar of pickles at the back that nobody opened in months goes first.
+    - **LFU, least frequently used**: throw out whatever gets used least often overall. Milk,
+      used daily, stays; the fancy sauce used twice a year goes.
+    - **TTL-based**: things have an expiry date, and expired items go first.
+    - **Random**: surprisingly decent, and very cheap to compute.
+
+    LRU is the usual default because it matches how most traffic behaves: things used recently tend
+    to be used again soon.
+
+    How big should the cache be? You do not need to fit *all* your data, only the **working set**:
+    the data that is actually being used in a given period. A shop may have 3 terabytes of product
+    data, but on any given day people only look at a few gigabytes of it. If the cache holds that
+    hot portion, almost every request is a hit.
+
+    That works because popularity is very uneven. A few items get a huge share of the traffic,
+    and a long tail of items is almost never requested. Doubling the cache from "holds the top
+    items" to "holds the top items and some of the tail" often moves the hit ratio by only a
+    percent or two.
+
+    Too small a cache, though, and popular items keep pushing each other out. The cache works hard
+    and helps little.
+  deeper: |
+    ### Redis eviction in practice
+    `maxmemory-policy` choices:
+
+    | Policy | Evicts | Use when |
+    |---|---|---|
+    | `allkeys-lru` | any key, approx. LRU | pure cache, the default choice |
+    | `allkeys-lfu` | any key, approx. LFU with decay | stable popularity, scan-resistant |
+    | `volatile-lru` / `volatile-ttl` | only keys with a TTL | mixing cache data with keys that must not be evicted |
+    | `noeviction` | nothing; writes fail when full | Redis as a primary store or queue |
+
+    Redis approximates LRU by sampling (`maxmemory-samples`, default 5), avoiding a global linked
+    list. LRU is vulnerable to **scan pollution**: one batch job reading a million cold keys evicts
+    the hot set. LFU, or segmented LRU variants (W-TinyLFU in Caffeine), resist that.
+
+    ### Sizing from the working set
+    ```
+    memory_needed = hot_items x (avg_value + key + ~50-100 B per-key overhead)
+                    / fill_target (0.7-0.8, leaves room for fragmentation)
+    ```
+    The simulator uses `coverage = min(1, memory x nodes x 0.8 / working_set_gb)` and a hit ratio
+    of roughly `0.985 x coverage^0.35 x ttl/(ttl+3)`. The exponent captures skew: covering 50% of
+    the working set already yields ~78% of the maximum hit ratio, and 25% coverage ~62%.
+
+    ### Zipf and diminishing returns
+    Real access often follows a Zipf-like distribution. Under typical skew, the top 1% of keys can
+    draw a large majority of requests. Each doubling of cache size adds a shrinking increment of
+    hit ratio. Find the knee by replaying a production key trace through a cache simulator
+    (miss-ratio curve), or by watching `evicted_keys` and hit ratio after each resize.
+
+    ### Failure modes
+    - **Evicting keys that are not cache data** (locks, rate-limit counters, sessions) under
+      `allkeys-*`. Separate instances by purpose.
+    - **Memory fragmentation**: RSS well above `used_memory`; check `mem_fragmentation_ratio`.
+    - **Big keys**: a 50 MB hash blocks the single-threaded event loop on eviction or deletion; use
+      `UNLINK` and keep values small.
+    - **Undersizing after growth**: hit ratio decays slowly as the working set grows; alert on hit
+      ratio and evictions, not just memory.
+
+    Interviewers expect you to size a cache from the hot set (not the full dataset), name LRU vs
+    LFU trade-offs, and explain why doubling a cache may barely help.
+  key_points:
+    - "Eviction policy decides what leaves a full cache: LRU is the default, LFU resists scans and suits stable popularity."
+    - "Size the cache to the working set, not the full dataset, with 20 to 30% headroom for overhead."
+    - "Skewed access means diminishing returns: half the working set can give most of the possible hit ratio."
+    - "Keep data that must not be evicted (locks, sessions, counters) in a separate instance or noeviction policy."
+  concepts: [eviction-policies, lru-eviction, lfu-eviction, working-set, cache-sizing]

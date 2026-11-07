@@ -1,0 +1,198 @@
+slug: black-friday
+kind: lab
+title: Black Friday
+difficulty: hard
+day: 24
+checkpoint: true
+summary: Doors open at midnight. Traffic triples in ten seconds, two servers die mid-rush, and most requests are product images. Profile the whole path and fix every layer that breaks.
+topics: [cdn, autoscaling, caching, health-checks, capacity-planning, cost-aware-design]
+company_tags: [Amazon, Shopify, Target]
+estimated_minutes: 45
+incident: "SEV-1 · checkout and browse down at 00:00 · 85% of requests failing · storefront CPU 337% · PostgreSQL saturated"
+
+brief_beginner: |
+  You run **Kestrel & Pine**, an online outdoor-gear store. On a normal evening about **6,000
+  requests per second** arrive. Most of them (60%) are for **static files**: product photos,
+  JavaScript, CSS. The rest are pages and searches, plus a few orders.
+
+  Tonight is Black Friday. At midnight the sale opens and traffic **triples within ten
+  seconds**. Twenty seconds later, two of your servers crash. Your current setup sends every
+  request, photos included, to a small fleet of app servers with no spare room, which all ask
+  one database. Nothing survives the first minute.
+
+  There is no single fix here. Walk the request path and ask at each layer: *does this request
+  need to come here at all?*
+  - A **CDN** (content delivery network) keeps copies of static files close to users, so photos
+    never reach your servers.
+  - A **cache** keeps the answers to popular product pages, so the database is not asked again
+    and again.
+  - **Headroom and autoscaling**: enough servers for the peak *plus* a couple of failures, and a
+    way to add more when the rush is longer than planned (new servers take ~20 s to boot).
+  - **Health checks** let the load balancer notice a dead server and stop sending it customers.
+
+  **Your job:** keep the store fast and almost error-free through the opening rush, within budget.
+
+brief_expert: |
+  6,000 rps baseline: 60% static, dynamic 90/10 read/write, 85% of reads cacheable (3 GB hot
+  set). At 00:00 traffic ramps to 3× over 10 s and holds for 45 s; at t=35 two app instances
+  die. Starter: no CDN, no cache, LB health checks off, 8 × medium app servers, PostgreSQL
+  medium: everything is on the critical path and nothing has headroom.
+
+  Work the bottlenecks in order of leverage: take static off the origin, take cacheable reads off
+  the database (and protect it from a cold cache at peak), size the app tier for the peak with
+  N+2 for failures, since autoscaling reacts in 5 s steps but boots in 20 s, and make sure dead
+  instances are removed. Expect the next things to break: the cache restarting mid-rush and a
+  scalper bot wave. Simply scaling the starter up does not fit the budget.
+
+glossary:
+  - term: CDN
+    meaning: A network of edge servers that keep copies of images and scripts near users. Here ~95% of static requests are served at the edge.
+  - term: Headroom
+    meaning: Spare capacity kept on purpose, so a spike or a dead server does not push you over 100%.
+  - term: Autoscaling
+    meaning: Adding servers automatically when CPU passes a target. Useful, but new servers take time to boot.
+  - term: Health check
+    meaning: The load balancer pings each server every few seconds and stops sending traffic to ones that do not answer.
+  - term: N+2
+    meaning: Enough capacity to handle the load even after losing two servers.
+
+requirements:
+  - Through the opening rush (3× traffic, two servers dying), p99 under 100 ms
+  - Error rate under 0.6%
+  - Stay within $3.70/hr
+
+budget: 3.7
+palette: [cdn, load_balancer, app_server, cache, database]
+
+starter:
+  nodes:
+    - {id: users, type: users, label: Shoppers, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, config: {health_checks: false}, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Storefront, config: {size: medium, instances: 8}, position: {x: 480, y: 160}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: medium}, position: {x: 720, y: 160}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, label: Shoppers, position: {x: 0, y: 160}}
+    - {id: cdn, type: cdn, label: CDN, position: {x: 240, y: 160}}
+    - {id: lb, type: load_balancer, config: {health_checks: true, rate_limit: true, rate_limit_rps: "50"}, position: {x: 480, y: 160}}
+    - {id: api, type: app_server, label: Storefront, config: {size: large, instances: 11, autoscaling: true, max_instances: 16}, position: {x: 720, y: 160}}
+    - {id: redis, type: cache, label: Redis, config: {memory_gb: "4", ttl_s: 300, stampede_protection: true}, position: {x: 960, y: 40}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: large, replicas: 1}, position: {x: 960, y: 280}}
+  edges:
+    - {source: users, target: cdn}
+    - {source: cdn, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: redis}
+    - {source: api, target: db}
+
+tests:
+  - id: doors-open
+    name: Doors open at midnight
+    summary: 6,000 req/s → 3× in 10 s for 45 s; two servers die at t=35s
+    scenario:
+      duration: 90
+      base_rps: 6000
+      read_ratio: 0.9
+      static_ratio: 0.6
+      cacheable: 0.85
+      working_set_gb: 3
+      spikes: [{at: 15, duration: 45, multiplier: 3, ramp: 10}]
+      events: [{at: 35, type: kill_app_instance, count: 2, label: "Two Storefront instances ran out of memory"}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 100}
+      - {metric: error_rate, op: lte, value: 0.6}
+  - id: cache-restart
+    name: Redis restarts mid-rush
+    summary: The cache comes back empty at t=40s, at 3× traffic
+    hidden: true
+    scenario:
+      duration: 90
+      base_rps: 6000
+      read_ratio: 0.9
+      static_ratio: 0.6
+      cacheable: 0.85
+      working_set_gb: 3
+      spikes: [{at: 15, duration: 45, multiplier: 3, ramp: 10}]
+      events:
+        - {at: 35, type: kill_app_instance, count: 2}
+        - {at: 40, type: cache_flush, label: "Redis failed over to an empty node"}
+    assertions:
+      - {metric: p99_ms, op: lte, value: 200}
+      - {metric: error_rate, op: lte, value: 0.8}
+  - id: scalper-bots
+    name: Scalper bots join the sale
+    summary: +9,000 req/s of bot traffic for 30 s during the rush
+    hidden: true
+    scenario:
+      duration: 90
+      base_rps: 6000
+      read_ratio: 0.9
+      static_ratio: 0.6
+      cacheable: 0.85
+      working_set_gb: 3
+      spikes: [{at: 15, duration: 45, multiplier: 3, ramp: 10}]
+      events:
+        - {at: 35, type: kill_app_instance, count: 2}
+        - {at: 30, type: bot_wave, ratio: 1.5, duration: 30, label: "Scalper bots: +9,000 req/s hammering product availability"}
+    assertions:
+      - {metric: p99_ms, op: lte, value: 110}
+      - {metric: error_rate, op: lte, value: 0.6}
+
+hints:
+  - Profile before you buy. Run the test and, for each box, ask what share of the traffic it receives actually needs to be there. Start with the 60% that are images and scripts.
+  - After the CDN and a cache, size the app tier for the peak by hand (~7,500 units of work at 3×) and check what happens when two instances vanish. Autoscaling alone cannot react to a 10 s ramp when new servers need 20 s to boot. And what does the load balancer do with a dead server?
+  - "Users → CDN → LB → Storefront → Redis + PostgreSQL. Turn on health checks, start with ~11 large instances and let autoscaling go higher, give Redis stampede protection and the database a replica for the cold-cache moment. Then think about scalpers: which LB setting stops 9,000 bot requests per second?"
+
+editorial: |
+  ### Why it broke
+  Every layer was on the critical path and none had headroom. At 3× the starter's storefront
+  fleet receives ~18,000 req/s including ~10,800 image requests, so it needs ~3× its capacity
+  (**peak 337% busy**). PostgreSQL is asked for every read, several times its ~1,500 units/s, and
+  peaks at 168% even though most requests are refused before they reach it. With health
+  checks off, the two dead instances keep receiving their share of traffic. **85% of requests
+  fail.**
+
+  ### The fix, layer by layer
+  | layer | change | effect at 3× |
+  |---|---|---|
+  | edge | **CDN** for static | 10,800 → ~540 image req/s reach the origin |
+  | data | **Redis cache-aside** (4 GB, 300 s TTL) | ~97% of cacheable reads never reach PostgreSQL |
+  | data | **PostgreSQL large + 1 replica** | misses, uncacheable reads and orders spread over two nodes: peak ~47% busy |
+  | compute | **11 large + autoscaling to 16** | ~7,500 units on 11,000 (~68%); peak 84% after losing 2, until replacements boot |
+  | routing | **health checks** | dead instances removed after ~3 s instead of forever |
+
+  Result: **p99 ~70 ms, 0.48% errors** (most of it the 3 s before health checks pull the dead
+  servers, plus 0.2% of real users caught by the rate limiter).
+
+  ### Why autoscaling alone is not enough
+  Starting at 5 instances with autoscaling, the fleet requests more at t=25, but new servers are
+  ready only at t=45. In between, the ramp and the two crashes push it past 100%: about **10%
+  errors**. Even starting at 9, losing two instances at t=35 leaves 7 servers at ~108% until the
+  replacements boot. Autoscaling handles the *long* rush; **headroom** handles the first minute.
+
+  ### The traps the hidden tests probe
+  - **Redis restarts mid-rush.** Every cacheable read misses at once, at peak traffic. Stampede
+    protection collapses duplicate misses (~75% fewer queries while cold), and the replica gives
+    the database room to absorb the rest: p99 stays ~73 ms, versus ~640 ms without stampede
+    protection and ~1.5 s without the replica.
+  - **Scalper bots.** +9,000 uncacheable req/s go straight to the storefront and the database. A
+    per-client limit of 50 req/s blocks 97% of them while touching 0.2% of shoppers. Without
+    it, errors climb to ~13%.
+
+  ### Alternatives and why not
+  - **Scale the starter up (no CDN, no cache)**: ~14 large instances (a quarter of their work
+    is serving photos) plus an xlarge database: far over budget, and every image still costs a server round trip.
+  - **Pre-scale to 16 fixed instances**: works technically, but at ~$3.79/hr it breaks the budget
+    and pays for peak capacity all year. Headroom plus autoscaling is cheaper.
+  - **Queue checkout writes**: orders are only ~1% of tonight's load; not the bottleneck.
+
+  ### Interview takeaway
+  Profile the path and remove work before adding capacity: static to the CDN, repeat reads to
+  the cache. Then plan capacity for peak plus failures (N+2), use autoscaling for duration rather
+  than for the first spike, and assume the cache, servers and bots will all misbehave at the
+  worst moment.

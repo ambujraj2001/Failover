@@ -1,0 +1,157 @@
+slug: one-server-one-bad-day
+kind: lab
+title: One server, one bad day
+difficulty: easy
+day: 1
+summary: A homework planner runs on a single small server. Term starts, traffic climbs, and it falls over. Scale out behind a load balancer.
+topics: [horizontal-scaling, load-balancing, capacity, redundancy]
+company_tags: [Amazon, Shopify]
+estimated_minutes: 15
+incident: "SEV-2 · 76% of requests failing on Brightboard API · single instance CPU 300%"
+
+brief_beginner: |
+  You run **Brightboard**, a homework planner used by schools. Students open it to check what is
+  due, and teachers post assignments. All of it runs on **one small server**.
+
+  On a quiet evening that server sees about **300 requests per second** and copes fine. Tonight is
+  the first day of term: within half a minute traffic climbs to **750 requests per second** and
+  stays there. One small server can only handle about **250**. Requests start piling up, pages take
+  seconds to load, and most students get an error.
+
+  Think of a shop with a single cashier. When the queue triples, you do not hire a cashier who
+  scans three times faster (that is expensive and has a ceiling). You open more tills, and you put
+  someone at the door pointing each customer to a free one. In system design, the extra tills are
+  extra **instances** of your server, and the person at the door is a **load balancer**.
+
+  **Your job:** keep Brightboard fast on the first night of term by running several servers instead
+  of one, and make sure customers can actually reach all of them.
+
+brief_expert: |
+  Single `small` app instance (250 rps of unit work), wired directly from Users. Load ramps from
+  300 to 750 rps over 10 s and holds for 40 s; 90% reads, 10% writes (1.3 units each), so the peak is
+  ~770 work units, about 3x one instance. PostgreSQL (medium) is at ~50% and is not the bottleneck.
+
+  Scale horizontally behind an L7 load balancer. Size the pool so peak utilisation stays near 60%
+  (tail latency climbs steeply past ~75%), and assume an instance can die at peak: N+1 matters more
+  than raw throughput. A single bigger box is a valid capacity fix but a single point of failure.
+
+glossary:
+  - term: Instance
+    meaning: One running copy of your server program. Running several copies lets you handle more requests.
+  - term: Load balancer
+    meaning: A component that receives every request and passes it to one of your instances, spreading the work evenly.
+  - term: Horizontal scaling
+    meaning: Handling more load by adding more machines, rather than making one machine bigger (vertical scaling).
+  - term: Throughput
+    meaning: How many requests per second a system can complete.
+  - term: p99 latency
+    meaning: 99 out of 100 requests finish faster than this. It describes your unluckiest users.
+
+requirements:
+  - p99 latency under 70 ms while traffic climbs to 750 req/s
+  - Error rate under 0.5%
+  - Stay within $0.60/hr
+
+budget: 0.60
+palette: [load_balancer, app_server, database]
+
+starter:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 120}}
+    - {id: api, type: app_server, label: Brightboard API, config: {size: small, instances: 1}, position: {x: 240, y: 120}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: medium}, position: {x: 480, y: 120}}
+  edges:
+    - {source: users, target: api}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 120}}
+    - {id: lb, type: load_balancer, label: Load Balancer, config: {health_checks: true}, position: {x: 240, y: 120}}
+    - {id: api, type: app_server, label: Brightboard API, config: {size: small, instances: 5}, position: {x: 480, y: 120}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: medium}, position: {x: 720, y: 120}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: db}
+
+tests:
+  - id: first-night
+    name: First night of term
+    summary: Traffic climbs from 300 to 750 req/s and stays there
+    scenario:
+      base_rps: 300
+      read_ratio: 0.9
+      spikes: [{at: 10, duration: 40, multiplier: 2.5, ramp: 10}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 70}
+      - {metric: error_rate, op: lte, value: 0.5}
+  - id: instance-dies
+    name: A server dies at peak
+    summary: One instance crashes at t=30s while traffic is at 750 req/s
+    hidden: true
+    scenario:
+      base_rps: 300
+      read_ratio: 0.9
+      spikes: [{at: 10, duration: 40, multiplier: 2.5, ramp: 10}]
+      events: [{at: 30, type: kill_app_instance, count: 1}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 105}
+      - {metric: error_rate, op: lte, value: 1.5}
+  - id: next-month
+    name: Exam season
+    summary: Traffic climbs to 3x instead of 2.5x
+    hidden: true
+    scenario:
+      base_rps: 300
+      read_ratio: 0.9
+      spikes: [{at: 10, duration: 40, multiplier: 3, ramp: 10}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 105}
+      - {metric: error_rate, op: lte, value: 0.5}
+
+hints:
+  - Run the test and look at which box turns red, and how busy it is. Compare 750 requests per second with what one small instance can do.
+  - Raising the instance count on a server that Users connect to directly does nothing, because without something in front of them users only ever reach one copy. What component spreads requests across copies?
+  - Put a Load Balancer between Users and the API (Users → Load Balancer → API) and give the API about 5 small instances so peak load sits near 60%. Keep health checks on, and ask yourself what happens if one of those instances dies at the worst moment.
+
+editorial: |
+  ### Why it broke
+  One `small` instance completes about **250 units of work per second**. At peak you send it
+  **750 req/s**: 90% reads (1 unit each) and 10% writes (1.3 units each), so roughly **770 units**,
+  three times what it can do. Past 100% busy a queue forms, every request waits behind the ones
+  before it, and once the queue is full the server starts refusing work. In the starter run
+  **76% of requests fail** and the ones that succeed take around **680 ms** at p99.
+
+  The database is fine: it sits near 50% busy. This is purely a compute bottleneck.
+
+  ### The fix: scale out behind a load balancer
+  ```
+  Users → Load Balancer → API × 5 (small) → PostgreSQL
+  ```
+  Five small instances give **1,250 units/s**, so the 770-unit peak runs at about **62%** busy.
+  p99 drops to about **58 ms** with no errors, for **$0.44/hr**.
+
+  Two things matter here:
+  * **Adding instances alone does nothing** while Users connect straight to the API. Without a load
+    balancer in front, clients only know one address and reach one copy.
+  * **Where you aim on utilisation.** Four instances also "fit" (77% busy), but queueing delay grows
+    steeply as you approach 100%: four small instances give a p99 of about **100 ms**. Planning for
+    roughly 60% at peak leaves room for the unexpected.
+
+  ### The trap: losing a machine at peak
+  The hidden tests kill one instance in the middle of the rush and push traffic to 3x. With five
+  instances, losing one leaves four at about 77% busy: slower, but standing. The load balancer's
+  health checks stop sending traffic to the dead instance within about 3 seconds, so only about
+  **1.3%** of requests fail over the whole run.
+
+  ### Why not one big server?
+  A single `large` instance (1,000 units/s) handles the load and costs about the same. But when it
+  dies, **everything** dies: in the crash test it fails more than half of all requests. Vertical
+  scaling also has a ceiling (`xlarge` is the biggest box) and every upgrade is a restart. Horizontal
+  scaling gives you capacity *and* redundancy, as long as the servers are stateless.
+
+  ### Interview takeaway
+  Start with the numbers: peak requests per second × work per request ÷ capacity per instance, then
+  add headroom (aim for ~60% at peak) and one spare (N+1). Stateless services behind a load balancer
+  with health checks are the default answer for "the server is overloaded".

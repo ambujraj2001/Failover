@@ -1,0 +1,195 @@
+slug: the-write-burst
+kind: lab
+title: The write burst
+difficulty: medium
+day: 10
+checkpoint: true
+summary: Thousands of watches upload their workouts in the same 15 seconds. Absorb the burst with a queue and drain it at a pace the database can take.
+topics: [queues, async-processing, backpressure, write-heavy, burst-traffic]
+company_tags: [Strava, Garmin, Fitbit]
+estimated_minutes: 30
+incident: "SEV-2 · POST /v1/workouts 503s at 06:00 · PostgreSQL 133% busy · in-flight limit hit on Ingest API"
+
+brief_beginner: |
+  You run the backend for **Strideline**, a running watch. When a watch finishes a workout it
+  uploads it to your **Ingest API**, which writes it into PostgreSQL. The phone app also reads
+  recent workouts from the same database.
+
+  On a normal morning that is about **900 requests per second**, and 80% of them are uploads
+  (*writes*). At 06:00 today a firmware update finished on thousands of watches at once, they all
+  reconnected, and for about 15 seconds traffic jumped to **four times normal**. The database can
+  only save so many rows per second. It fell behind, requests piled up waiting for it, and the
+  API started refusing uploads. Runners saw "sync failed".
+
+  Here is the thing: a runner does not need their workout to be *in the database* within 5
+  milliseconds. They need the watch to hear **"got it"** quickly. The saving can happen a few
+  seconds later.
+
+  A **message queue** is a waiting line for work. The API drops each upload into the queue
+  (very fast) and replies "got it". Separate **workers** take uploads off the queue and write them
+  to the database at a steady pace, so the burst turns into a short backlog instead of an outage.
+
+  **Your job:** accept every upload quickly during the burst, and let the database catch up
+  without falling over.
+
+brief_expert: |
+  Write-dominated ingest: 900 rps baseline (80% `INSERT workout`, 20% indexed reads), a 4× burst
+  for 15 s with a 3 s ramp (3,600 rps, ~2,900 writes/s). Writes cost 1.5 units on PostgreSQL;
+  the large instance (~3,500 units/s) needs ~5,000 at the peak. The Ingest API is cheap per request
+  and is not the bottleneck; its threads are, once they block on a saturated primary.
+
+  Decouple acknowledgement from persistence: API → queue (ack in ~2 ms), queue → workers →
+  PostgreSQL. Size the drain rate below what the primary can take *while still serving reads*
+  (backpressure), and above the steady-state write rate so the backlog actually drains. Queue lag
+  must stay bounded and no write may be lost. An xlarge primary would absorb this burst but does
+  not fit the budget, and the next burst will be bigger.
+
+glossary:
+  - term: Message queue
+    meaning: A durable waiting line for work (Kafka, SQS, RabbitMQ). Producers add messages; consumers take them off later.
+  - term: Worker
+    meaning: A background process that pulls messages from the queue and does the slow part, here the database insert.
+  - term: Queue lag
+    meaning: How far behind the workers are, in seconds. 20 s lag means a workout uploaded now is saved about 20 s later.
+  - term: Backpressure
+    meaning: Deliberately limiting how fast work flows into a component so it is never pushed past what it can handle.
+  - term: Asynchronous write
+    meaning: The caller gets "accepted" right away and the actual save happens later, instead of waiting for it.
+
+requirements:
+  - p99 latency under 100 ms during a 4× upload burst
+  - Error rate under 0.5% and zero lost writes
+  - Queue lag under 25 s (workouts appear in the app within half a minute)
+  - Stay within $1.20/hr (an xlarge database does not fit)
+
+budget: 1.2
+palette: [load_balancer, app_server, database, queue, worker]
+
+starter:
+  nodes:
+    - {id: users, type: users, label: Watches, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Ingest API, config: {size: large, instances: 3}, position: {x: 480, y: 160}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: large, indexes: "id, user_id"}, position: {x: 960, y: 160}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, label: Watches, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Ingest API, config: {size: large, instances: 3}, position: {x: 480, y: 160}}
+    - {id: queue, type: queue, label: Upload queue, config: {partitions: 1}, position: {x: 720, y: 40}}
+    - {id: workers, type: worker, label: Ingest workers, config: {size: small, instances: 3}, position: {x: 960, y: 40}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: large, indexes: "id, user_id"}, position: {x: 1200, y: 240}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: queue}
+    - {source: queue, target: workers}
+    - {source: workers, target: db}
+    - {source: api, target: db}
+
+tests:
+  - id: burst
+    name: Firmware update finishes
+    summary: 900 req/s, 80% uploads; 4× burst for 15 s
+    scenario:
+      duration: 120
+      base_rps: 900
+      read_ratio: 0.2
+      app_work: 0.5
+      spikes: [{at: 20, duration: 15, multiplier: 4, ramp: 3}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 100}
+      - {metric: error_rate, op: lte, value: 0.5}
+      - {metric: queue_lag_s, op: lte, value: 25}
+      - {metric: write_loss_rate, op: lte, value: 0}
+  - id: long-burst
+    name: A longer burst while people check the app
+    summary: 25 s burst, and a quarter of traffic is reads
+    hidden: true
+    scenario:
+      duration: 120
+      base_rps: 900
+      read_ratio: 0.25
+      app_work: 0.5
+      spikes: [{at: 20, duration: 25, multiplier: 4, ramp: 3}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 120}
+      - {metric: error_rate, op: lte, value: 0.5}
+      - {metric: queue_lag_s, op: lte, value: 40}
+      - {metric: write_loss_rate, op: lte, value: 0}
+  - id: double-burst
+    name: A second wave of watches
+    summary: Two bursts 40 s apart, before the first backlog has fully drained
+    hidden: true
+    scenario:
+      duration: 150
+      base_rps: 900
+      read_ratio: 0.2
+      app_work: 0.5
+      spikes:
+        - {at: 20, duration: 15, multiplier: 4, ramp: 3}
+        - {at: 60, duration: 15, multiplier: 4, ramp: 3}
+    assertions:
+      - {metric: p99_ms, op: lte, value: 100}
+      - {metric: error_rate, op: lte, value: 0.5}
+      - {metric: queue_lag_s, op: lte, value: 45}
+
+hints:
+  - Run the burst and watch which box turns red first. The API has spare CPU; something it is waiting on does not.
+  - Does the watch need the workout saved in PostgreSQL before it hears "OK", or only safely recorded somewhere? What component lets you reply first and save later?
+  - Add a Message Queue (API → Queue → Worker → PostgreSQL) and keep API → PostgreSQL for reads. Each small worker drains about 385 writes/s here. Pick a drain rate above the normal 720 writes/s (or the backlog never clears) but well below what the primary can take alongside its reads (or the burst just moves to the database). Three small workers is a good place to start; more is not always better.
+
+editorial: |
+  ### Why it broke
+  At the peak the API receives ~3,600 req/s, of which ~2,900 are uploads. Each insert costs 1.5
+  units on PostgreSQL, so the primary is asked for **~4,300 units/s of writes plus ~700 reads**
+  against a capacity of ~3,500, over 140% of what it can do. The simulator shows it pinned at
+  **133%** (a little load never arrives because the API is already refusing it). Queries wait, every API thread ends up parked
+  on a slow insert, and the API hits its in-flight limit: **11% of requests fail and p99 reaches
+  ~1.5 s**, even though API CPU never passes 75%.
+
+  The burst lasts 15 seconds. The database is perfectly able to store 15 seconds of uploads; it
+  just cannot store them *in* 15 seconds.
+
+  ### The fix: acknowledge now, persist at a steady rate
+  ```
+  POST /v1/workouts
+    → enqueue(workout)            (~2 ms)  → 202 Accepted
+  worker loop
+    → dequeue → INSERT INTO workouts …   at ≤ ~1,150 writes/s
+  ```
+  - **Queue**: one partition takes 5,000 msg/s; the peak is ~2,900. Uploads are acknowledged in
+    milliseconds, so p99 drops to **~76 ms**.
+  - **Workers**: 3 small workers drain **~1,150 writes/s** (1,730 units on the primary). With
+    ~720 reads at the peak, PostgreSQL tops out around **70%**.
+  - **Backlog**: during the burst ~25k uploads queue up. Workers drain the excess at
+    ~430/s (1,150 drain − 720 arriving), so **lag peaks at ~21 s** and is gone a minute later.
+    Nothing is lost.
+
+  ### The trap: draining too fast
+  It is tempting to add lots of workers "so lag is zero". Six medium workers drain ~2,300
+  writes/s, which is ~3,450 units: the queue now forwards the burst straight into PostgreSQL,
+  the primary hits 140% again and **reads** start failing (error rate 9%). A queue only helps if
+  the consumer side is **rate-limited below what the database can take**. That is backpressure.
+  The hidden tests probe both sides: a longer burst with more reads (too many workers starve the
+  reads) and a second burst before the first backlog has drained (too few workers let lag grow
+  without bound; two small workers barely exceed the 720 writes/s baseline and lag passes 60 s).
+
+  ### Alternatives and why not
+  - **xlarge PostgreSQL** (~8,000 units/s): survives this burst at ~63% but costs ~$0.36/hr more,
+    which breaks the budget, and every future burst means another vertical step until there are
+    none left.
+  - **Batching inserts in the API**: helps throughput, but the API still holds the request open
+    until the batch commits, so you keep the thread pile-up.
+  - **Shedding load (429 to watches)**: watches would retry, which turns a 15 s burst into a
+    longer one. Accepting into a durable queue is cheaper and kinder.
+
+  ### Interview takeaway
+  When writes arrive in bursts and the client only needs an acknowledgement, put a durable
+  queue in front of the database. Size consumers between the *average* write rate and what the
+  store can absorb, and monitor **queue lag** as the user-facing freshness metric.

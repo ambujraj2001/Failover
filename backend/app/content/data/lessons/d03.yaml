@@ -1,0 +1,166 @@
+- slug: sql-vs-nosql
+  day: 3
+  title: SQL vs NoSQL
+  minutes: 10
+  summary: Relational databases give you flexible queries and transactions; NoSQL stores trade some of that for simple scaling around one known access pattern.
+  plain: |
+    A **database** is a program whose job is to store data safely and find it again quickly.
+    There are two broad families.
+
+    **SQL (relational) databases**, like PostgreSQL and MySQL, store data in **tables**: rows and
+    columns, like a spreadsheet with strict rules. A `users` table and an `orders` table can be
+    connected by a user ID, and you can ask questions that combine them ("all orders from users in
+    Spain last week") using a language called **SQL**. The structure, called the **schema**, is
+    declared up front.
+
+    Relational databases also offer **transactions**: a group of changes that either all happen or
+    none happen. Moving money from Alice to Bob is two changes (subtract, add). A transaction
+    guarantees you never end up with only one of them. The guarantees are summarised as **ACID**:
+
+    - **Atomic**: all or nothing.
+    - **Consistent**: the rules you declared (like "balance cannot be negative") always hold.
+    - **Isolated**: two transactions running at once do not see each other's half-finished work.
+    - **Durable**: once it says "saved", a power cut will not lose it.
+
+    **NoSQL databases** is a catch-all for everything else. Some store simple key-value pairs
+    (like a giant dictionary), some store flexible documents (JSON), some are built to spread
+    enormous amounts of data across hundreds of machines.
+
+    An analogy: a relational database is a well-organised library with a catalogue that can answer
+    almost any question. A key-value store is a wall of numbered lockers: unbeatable if you know
+    the locker number, useless if you want "all lockers containing red bags".
+
+    The default for most new systems is a relational database. Reach for NoSQL when you have a
+    specific reason.
+  deeper: |
+    ### The real axes of the decision
+    | Question | Leans relational | Leans NoSQL |
+    |---|---|---|
+    | Access patterns known up front? | no, ad-hoc queries and reporting | yes, few, key-based |
+    | Multi-row/multi-entity invariants? | yes (money, inventory) | rarely |
+    | Data size / write rate | up to a few TB, tens of k writes/s on one primary | beyond one machine's write capacity |
+    | Joins | many | denormalised, read one item or one partition |
+    | Ops team | familiar with Postgres/MySQL | managed service (DynamoDB, Bigtable) |
+
+    ### NoSQL families
+    - **Key-value**: Redis, DynamoDB. O(1) get/put by key. DynamoDB gives single-digit ms at
+      effectively unlimited scale if the partition key spreads load.
+    - **Document**: MongoDB, Firestore. JSON documents, secondary indexes, good when an entity is
+      read as one blob.
+    - **Wide-column**: Cassandra, ScyllaDB, Bigtable. Partition key plus clustering key, very high
+      write throughput, LSM-tree storage. Chat messages and time series fit well.
+    - **Graph**: Neo4j. Multi-hop traversals that would be recursive joins in SQL.
+
+    ### ACID, precisely
+    Isolation is the letter that bites. PostgreSQL defaults to **Read Committed**, which permits
+    lost updates in read-modify-write code (`SELECT balance` then `UPDATE balance = x`). Fix with
+    `SELECT ... FOR UPDATE`, an atomic `UPDATE ... SET balance = balance - 10 WHERE balance >= 10`,
+    or Serializable isolation (with retries on serialisation failures).
+
+    Many NoSQL stores offer atomicity per item or per partition only. DynamoDB and MongoDB have
+    multi-item transactions, at higher latency and cost, with limits on item count.
+
+    ### Numbers
+    One well-tuned PostgreSQL primary on NVMe handles tens of thousands of simple writes per second
+    and far more indexed reads, and stores several TB comfortably. In this course's simulator a
+    medium PostgreSQL node handles 1,500 indexed point queries per second and an xlarge 8,000;
+    labs are sized so that the bottleneck is visible.
+
+    ### When not to use NoSQL
+    - "Schemaless" is not free: the schema moves into application code and every reader must
+      handle every historical shape.
+    - Designing for a query you did not anticipate means a new table or index and a backfill.
+    - Choosing Cassandra for 500 writes per second buys operational burden with no benefit.
+
+    Interviewers want a justified choice tied to access patterns and consistency needs, not a
+    slogan. "Postgres, because orders need transactions and we are at 2k writes/s; we will
+    revisit sharding past that" is a strong answer.
+  key_points:
+    - "Relational databases give schemas, joins, ad-hoc queries and multi-row ACID transactions; they are the right default."
+    - "NoSQL stores optimise for known key-based access patterns and horizontal scale, usually with per-item atomicity."
+    - "Choose by access patterns, invariants and write volume, not by data size alone."
+    - "Read Committed allows lost updates; use atomic updates, row locks or Serializable for read-modify-write."
+  concepts: [relational-databases, nosql-data-models, acid-transactions, isolation-levels]
+
+- slug: indexes-and-query-plans
+  day: 3
+  title: Indexes and query plans
+  minutes: 11
+  summary: An index lets the database jump straight to matching rows instead of reading the whole table, and the query plan tells you whether it actually did.
+  plain: |
+    Imagine a 900-page cookbook with no index at the back. To find every recipe that uses
+    saffron, you read all 900 pages. With an index ("saffron: pages 112, 431, 702"), you flip to
+    three pages. Same book, same answer, thousands of times less work.
+
+    A database **index** is exactly that: a separate, sorted structure that maps a column's values
+    to the rows that contain them. Without one, the database does a **full table scan**: it reads
+    every row and checks each one. With 50 rows that is instant. With 50 million rows it takes
+    seconds, and while it does that it is not answering anyone else.
+
+    The catch: an index is not free. Every time you add or change a row, the database must also
+    update every index on that table, the way a cookbook author must update the back pages when
+    adding a recipe. Indexes also take disk space and memory. So you add indexes for the questions
+    you ask often, not for every column.
+
+    How do you know whether the database used an index? You ask it. Putting `EXPLAIN` in front of
+    a query shows the **query plan**: the steps the database intends to take. If you see
+    "Seq Scan" (sequential scan) on a big table, it is reading everything. If you see "Index Scan",
+    it is using the index.
+
+    A very common production incident looks like this: a new feature adds a query that filters on a
+    column with no index. It works perfectly in testing with a small table, then brings the
+    database to its knees with real data. The fix is often a single line.
+  deeper: |
+    ### What a B-tree buys you
+    Most relational indexes are **B-trees**: balanced, wide trees (hundreds of keys per 8 KB page),
+    so even a billion-row table is only 4 to 5 levels deep. A point lookup touches ~4 pages, mostly
+    already in memory. A full scan of a 50 GB table touches millions of pages.
+
+    ### Reading a plan
+    ```sql
+    EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id = 42;
+
+    -- before
+    Seq Scan on orders  (cost=0.00..1834521.00 rows=48 width=96)
+      Filter: (customer_id = 42)
+      Rows Removed by Filter: 49999952
+    Execution Time: 6312.4 ms
+
+    -- after: CREATE INDEX CONCURRENTLY idx_orders_customer ON orders (customer_id);
+    Index Scan using idx_orders_customer on orders  (cost=0.56..52.10 rows=48 width=96)
+      Index Cond: (customer_id = 42)
+    Execution Time: 0.21 ms
+    ```
+
+    "Rows Removed by Filter" in the millions is the tell. In the simulator, a read on an unindexed
+    column costs 15 units instead of 1, so a database that was at 40% utilisation is suddenly at
+    600%.
+
+    ### Composite and covering indexes
+    An index on `(customer_id, created_at)` serves `WHERE customer_id = ?`, and
+    `WHERE customer_id = ? ORDER BY created_at DESC LIMIT 20`, but not `WHERE created_at > ?` alone:
+    the **leftmost prefix** rule. Put equality columns first, then range or sort columns. Add
+    `INCLUDE (status, total)` to make it **covering**, so the query never touches the table heap.
+
+    ### Trade-offs and failure modes
+    - **Write amplification**: each index adds a B-tree insert per row write. Tables with 10+
+      indexes often spend more I/O on indexes than on data.
+    - **Low selectivity**: an index on a boolean or a status with 3 values is usually ignored; the
+      planner correctly prefers a scan when a large fraction of rows match.
+    - **Functions defeat indexes**: `WHERE lower(email) = ?` needs an expression index on
+      `lower(email)`.
+    - **Building in production**: plain `CREATE INDEX` blocks writes for the duration; use
+      `CONCURRENTLY` (PostgreSQL) or online DDL tools.
+    - **Stale statistics** make the planner pick bad plans; `ANALYZE` after bulk loads.
+
+    ### What interviewers probe
+    Given a query, name the index. Given a composite index, say which queries it serves. Explain
+    why adding an index can slow writes, and how you would find the missing one in production:
+    `pg_stat_statements` sorted by total time, then `EXPLAIN ANALYZE` the top offenders.
+  key_points:
+    - "Without an index the database scans every row; a B-tree index turns that into a handful of page reads."
+    - "EXPLAIN (ANALYZE) shows the plan: Seq Scan with millions of rows removed by filter means a missing index."
+    - "Composite indexes follow the leftmost-prefix rule: equality columns first, then range or sort columns."
+    - "Every index costs write throughput, disk and memory; index the queries you actually run."
+    - "Build indexes on live tables with CREATE INDEX CONCURRENTLY or online DDL."
+  concepts: [database-indexes, b-tree-index, query-plans, composite-indexes, covering-indexes]

@@ -1,0 +1,165 @@
+- slug: vertical-vs-horizontal
+  day: 6
+  title: Vertical vs horizontal scaling
+  minutes: 9
+  summary: You can buy a bigger machine or add more machines; adding machines only works when servers are stateless, and it is the only path with no ceiling.
+  plain: |
+    A food truck has more customers than it can serve. It has two options.
+
+    - **Vertical scaling ("scale up")**: replace the truck with a bigger one, with a bigger grill and
+      two more cooks inside. Simple, nothing else changes. But there is a biggest truck you can buy,
+      and while you swap trucks, nobody gets fed.
+    - **Horizontal scaling ("scale out")**: park three more identical trucks next to the first. No
+      upper limit, and if one truck breaks down, the other three keep serving.
+
+    Horizontal scaling has one condition. If a customer orders at truck 1 and comes back later to
+    pay at truck 3, truck 3 must know about the order. Either every truck shares one order book, or
+    customers must always go back to the same truck.
+
+    In software, a server that remembers things about a user between requests (who is logged in,
+    what is in their basket) in its own memory is called **stateful**. A server that keeps nothing
+    between requests, and looks everything up in a shared place like a database or Redis, is
+    **stateless**. Any stateless server can answer any request, so a load balancer can send traffic
+    anywhere, and you can add or remove servers freely.
+
+    So the rule: make your app servers stateless, keep the state in a shared store, and you can
+    scale them horizontally almost without limit.
+
+    Databases are harder, because they *are* the state. They usually scale up first, then out with
+    replicas and partitioning, which later lessons cover.
+  deeper: |
+    ### Same cost per unit, different properties
+    In the simulator, app server sizes scale linearly in both capacity and price:
+
+    | Size | rps / instance | $/hr | $ per 1k rps |
+    |---|---|---|---|
+    | small | 250 | 0.04 | 0.16 |
+    | medium | 500 | 0.085 | 0.17 |
+    | large | 1,000 | 0.17 | 0.17 |
+    | xlarge | 2,000 | 0.34 | 0.17 |
+
+    Cloud pricing is roughly linear too, until the largest instance types where you pay a premium.
+    So the choice is rarely about price. It is about:
+
+    - **Ceiling**: the largest machine is finite (~200 vCPU, a few TB RAM). Horizontal has no hard
+      ceiling for stateless tiers.
+    - **Blast radius**: losing one of 2 xlarge instances loses 50% of capacity; losing one of 16
+      medium instances loses ~6%.
+    - **Granularity**: autoscaling in 500 rps steps tracks demand more tightly than 2,000 rps steps.
+    - **Overhead**: each instance has fixed costs (runtime, connection pools, health checks). Many
+      tiny instances multiply database connections: 200 instances × 20 pool connections = 4,000
+      connections, beyond what PostgreSQL handles without a pooler.
+
+    ### Making a service stateless
+    | State | Move it to |
+    |---|---|
+    | Sessions | Redis, or signed tokens (JWT) carried by the client |
+    | Uploaded files | object storage (S3), not local disk |
+    | In-process caches | fine as an optimisation if a miss is safe; shared truth goes in Redis |
+    | Scheduled jobs | a single scheduler or a queue, not "every instance runs cron" |
+    | WebSocket connections | inherently sticky; route by user and keep a registry (Day 14) |
+
+    ### When vertical is the right answer
+    - The database primary, until you have exhausted replicas, caching and query fixes. Sharding is
+      a one-way door with large operational cost.
+    - Workloads with heavy shared memory (large in-memory graphs, single-threaded engines).
+    - Early-stage systems where one bigger box avoids a week of work.
+
+    ### Failure modes
+    - "Stateless" services that write temp files, or rely on in-memory rate-limit counters, behave
+      inconsistently behind a load balancer.
+    - Scaling out the app tier moves the bottleneck to the database: ten times more instances can
+      mean ten times more concurrent queries against a box that was already at 80%.
+
+    Interviewers want to hear that you scale stateless tiers horizontally by default, know what
+    state has to move out, and recognise that the database is where the hard scaling work is.
+  key_points:
+    - "Vertical scaling is simple but has a ceiling and a large blast radius; horizontal scaling has neither."
+    - "Horizontal scaling requires stateless servers: sessions, files and jobs live in shared stores."
+    - "Price per unit of capacity is roughly linear, so choose on ceiling, blast radius and granularity."
+    - "Scaling out the app tier multiplies database connections and load; watch the next bottleneck."
+  concepts: [vertical-scaling, horizontal-scaling, stateless-services, externalized-session-state]
+
+- slug: autoscaling-in-practice
+  day: 6
+  title: Autoscaling in practice
+  minutes: 10
+  summary: Autoscaling adds and removes servers based on load, but it reacts with a delay, so you still need headroom for the first minute of a spike.
+  plain: |
+    A restaurant manager watches the queue. When it gets long, they call in extra staff; when it is
+    quiet, staff go home. That saves money on slow afternoons. But a new cook needs twenty minutes to
+    arrive and put on an apron. If a tour bus pulls up, the first twenty minutes are rough no matter
+    how quickly the manager phones.
+
+    **Autoscaling** is that manager, automated. It watches a **metric**, usually average **CPU
+    utilisation** (how busy the processors are), and keeps it near a **target**, for example 60%.
+    Above target, it adds **instances** (copies of your server). Below, it removes some.
+
+    The important part is the delay. A new server has to start, load your code and pass health
+    checks before it takes traffic. That **boot time** is often 20 seconds to a few minutes. Then
+    the autoscaler only checks every so often. During that gap, the servers you already have must
+    carry the load.
+
+    That is why the target is 60% and not 95%. The spare 40% is **headroom**: room to absorb a sudden
+    surge while new servers boot. With no headroom, a spike overloads the existing servers, requests
+    pile up, and users see errors before help arrives.
+
+    Two more settings matter:
+
+    - **Minimum instances**: never go below this, even at 3 am. Protects against the morning rush.
+    - **Maximum instances**: never go above this. Protects your wallet, and your database, from a
+      runaway.
+
+    Autoscaling handles gradual change beautifully. For sudden spikes, combine it with headroom,
+    or scale up ahead of time when you know a spike is coming.
+  deeper: |
+    ### Reaction time is the whole story
+    ```
+    t=0     traffic jumps 4x
+    t=0-5   metric window fills, scaler decides       (simulator: checks every 5 s)
+    t=5-25  new instances boot and pass health checks (simulator: 20 s boot)
+    t=25+   capacity arrives
+    ```
+    Real clouds are slower: metrics at 60 s granularity, VMs in 60 to 180 s, containers on warm nodes
+    in 5 to 30 s, plus cluster autoscaler adding nodes in minutes. For the first ~25 s the existing
+    fleet absorbs the spike alone.
+
+    ### Headroom math
+    Running at target utilisation `u`, the fleet can absorb a surge of `1/u` before saturating.
+    At u = 0.6 that is 1.67x; at u = 0.8 only 1.25x. If spikes are 3x, either run at ~33%, pre-scale,
+    or shed load until capacity arrives. Pick the target from the largest spike you must absorb
+    within one scaling reaction time.
+
+    ### Choosing the metric
+    | Metric | Good for | Pitfall |
+    |---|---|---|
+    | CPU | CPU-bound services | I/O-bound services sit at 20% CPU while threads are exhausted |
+    | Requests per instance | uniform request cost | needs a known per-instance capacity |
+    | In-flight / concurrency | I/O-bound services | noisy at low traffic |
+    | Queue depth / lag | workers | scale on lag per worker, not raw depth |
+
+    ### Failure modes
+    - **Scaling the wrong tier**: if the database is the bottleneck, more app instances add
+      connections and contention and make latency worse. Max instances protect downstream.
+    - **Flapping**: aggressive scale-in removes capacity just before the next burst. Use a longer
+      scale-in cooldown (5 to 15 min) than scale-out.
+    - **Death spiral**: overloaded instances fail health checks, get replaced, and new instances
+      arrive cold to the same overload. Load shedding and slow-start on the LB break the loop.
+    - **Cold instances**: JIT warm-up, empty local caches and new connection pools make fresh
+      instances slower for their first minute.
+
+    ### Beyond reactive
+    - **Scheduled scaling** for known peaks (9 am, a 7 pm push notification, a sale).
+    - **Predictive scaling** from historical daily and weekly patterns.
+    - **Minimum capacity sized for the steepest credible ramp**, with autoscaling handling the
+      slower tail.
+
+    Interviewers probe whether you know autoscaling is not instant, can compute headroom, and
+    protect the database with a sensible maximum.
+  key_points:
+    - "Autoscaling tracks a target metric (often 60% CPU) by adding and removing instances."
+    - "Capacity arrives after decision time plus boot time; the existing fleet must absorb the spike until then."
+    - "At target utilisation u the fleet absorbs a 1/u surge: 1.67x at 60%, only 1.25x at 80%."
+    - "Scale on the metric that reflects the bottleneck, and cap max instances to protect the database."
+    - "Use scheduled or predictive scaling for known peaks and slower scale-in to avoid flapping."
+  concepts: [autoscaling, target-tracking-scaling, scaling-lag, capacity-headroom, predictive-scaling]

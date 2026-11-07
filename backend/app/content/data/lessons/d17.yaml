@@ -1,0 +1,102 @@
+- slug: sagas-and-outbox
+  day: 17
+  title: Sagas and the transactional outbox
+  minutes: 11
+  summary: "How to keep several services consistent without one big distributed transaction, using compensating steps and an outbox table that never loses an event."
+  plain: |
+    Inside one database a **transaction** is all-or-nothing: either every change lands or none does. Once an order touches three services — payments, inventory and shipping, each with its own database — no single transaction covers them all.
+
+    A **saga** is a sequence of small local transactions, one per service, where each step has a matching **compensating action** that undoes it in business terms. Booking a trip is the everyday version: you book the flight, then the hotel, then the car. If the car rental fails, you do not pretend the flight never happened; you cancel the hotel and cancel the flight, maybe paying a fee. The system is briefly inconsistent (flight booked, no car) but ends up consistent.
+
+    The tricky part is telling the next service what happened. Suppose the payments service saves "charged" to its database and then sends a message "payment done". If it crashes between the two, the money is taken and nobody ever hears about it. If it sends first and then crashes before saving, everyone hears about a payment that does not exist. This is the **dual-write problem**.
+
+    The **transactional outbox** fixes it. In the same local transaction that records the charge, the service also inserts a row into an `outbox` table: "event: payment done". Either both rows commit or neither does. A separate **relay** process reads the outbox and publishes each row to the message broker, marking it sent. If the relay crashes, it simply publishes again, so consumers must handle duplicates — which is the subject of the next lesson.
+  deeper: |
+    ### Why not two-phase commit
+    2PC (prepare, then commit) gives atomicity across resources but the coordinator is a blocking point: participants that voted "yes" hold locks until they hear the outcome. A coordinator crash can freeze rows for minutes. Most brokers and many cloud databases do not support XA at all. Sagas trade isolation for availability.
+
+    ### Orchestration vs choreography
+    | | Orchestration | Choreography |
+    |---|---|---|
+    | Control | one orchestrator calls each step (Temporal, Step Functions) | services react to each other's events |
+    | Visibility | the workflow state is in one place | spread across logs |
+    | Coupling | orchestrator knows all steps | each service knows its triggers |
+    | Good for | 4+ steps, payments, anything audited | 2–3 steps, simple fan-out |
+
+    For a payment flow, interviewers usually expect orchestration with a persisted state machine: `CREATED -> AUTHORIZED -> CAPTURED -> SETTLED`, with `VOIDED` / `REFUNDED` as compensations.
+
+    ### Design rules for compensations
+    - Compensations must be **idempotent** and **retryable forever**; a refund that fails must keep retrying, not give up.
+    - Some steps cannot be undone (an email sent, money paid out). Put **pivot** steps last, after everything that can still fail.
+    - Lack of isolation is real: another request can observe the half-done state. Use semantic locks (status `PENDING`) and design reads to tolerate them.
+
+    ### Outbox relay options
+    - **Polling**: `SELECT ... FROM outbox WHERE sent = false ORDER BY id LIMIT 500` every 100 ms–1 s. Simple; adds DB load and up to one poll interval of latency.
+    - **Change data capture**: Debezium tails the Postgres WAL or MySQL binlog and publishes rows. Sub-second, no polling load, but one more system to run.
+    - Order is preserved per aggregate if you publish with the aggregate id as the partition key.
+    - Purge sent rows on a schedule; an unbounded outbox becomes your largest table.
+
+    ### Failure modes interviewers probe
+    "The relay published but crashed before marking the row sent" — duplicate event, so consumers dedupe. "A compensation fails" — it goes to a retry queue with alerting, then to manual repair; never silently drops. "Two sagas touch the same account" — per-account ordering via partition key or a row lock in the account service.
+  key_points:
+    - "A saga is a chain of local transactions with business-level compensating actions instead of a global rollback."
+    - "The dual-write problem (save then publish) loses or invents events on a crash; the outbox puts both in one local transaction."
+    - "Outbox relays (polling or CDC) deliver at least once, so every consumer must be idempotent."
+    - "Prefer orchestration for long or audited flows like payments; put irreversible steps last."
+  concepts: [saga-pattern, transactional-outbox, two-phase-commit, change-data-capture, compensating-transaction]
+
+- slug: idempotency-and-exactly-once
+  day: 17
+  title: Idempotency keys, exactly-once and ledgers
+  minutes: 11
+  summary: "Why networks only give you at-least-once delivery, and how idempotency keys and an append-only double-entry ledger turn that into effectively-once money movement."
+  plain: |
+    An operation is **idempotent** if doing it twice has the same effect as doing it once. Pressing a lift button five times still calls one lift. Setting a thermostat to 21 degrees twice leaves it at 21. Adding 10 pounds to a balance is *not* idempotent: do it twice and the balance is 20 higher.
+
+    Networks force the issue. A client sends "charge 10 pounds", the server charges the card, and the reply is lost. The client cannot tell whether the request failed or the reply did, so it retries. Without protection the customer pays twice. No network can promise **exactly-once delivery**; it can promise **at-most-once** (never retry, sometimes lose) or **at-least-once** (retry, sometimes duplicate). We choose at-least-once and make the receiver idempotent, which gives an *effect* of exactly once.
+
+    The standard tool is an **idempotency key**: a unique ID the client generates for each logical action (for example a UUID per checkout click) and sends with every retry. The server stores the key with the result. If it sees the same key again, it returns the saved result instead of charging again.
+
+    Money systems add a **ledger**: an append-only record of every movement, written as **double entry**. Every transfer creates two lines that sum to zero — minus 10 from the customer, plus 10 to the merchant. You never edit a line; mistakes are fixed with new reversing lines. Balances are derived by summing lines, so the history always explains the number, and auditors can check that everything adds up to zero.
+  deeper: |
+    ### Idempotency key mechanics
+    ```sql
+    CREATE TABLE idempotency (
+      key        text PRIMARY KEY,
+      request_hash text NOT NULL,
+      status     text NOT NULL,      -- in_progress | done
+      response   jsonb,
+      created_at timestamptz DEFAULT now()
+    );
+    ```
+    1. `INSERT ... ON CONFLICT DO NOTHING`. If you inserted, you own the request.
+    2. If the row exists and is `done`, return the stored response. If `in_progress`, return 409 or wait.
+    3. If the stored `request_hash` differs from this request, reject: the client reused a key for a different action.
+    4. Do the work and write the response **in the same transaction** as the business change where possible.
+
+    Stripe keeps keys for 24 hours; that window should cover the longest client retry schedule. Scope keys per merchant or user so one tenant cannot collide with another.
+
+    ### Calling an external processor
+    The card network call is outside your transaction. Persist intent first (`AUTH_PENDING` with your own payment id), pass that id as the processor's idempotency key, then record the outcome. On timeout, do not guess: **reconcile** by querying the processor, and run a daily reconciliation against settlement files to catch drift.
+
+    ### "Exactly-once" in Kafka
+    Kafka's idempotent producer plus transactions give exactly-once **within Kafka** (read-process-write between topics). The moment a consumer writes to an external database or calls an API, you are back to at-least-once plus idempotent sinks: store the consumed offset in the same DB transaction, or upsert by a natural key.
+
+    ### Ledger design
+    | Rule | Why |
+    |---|---|
+    | Append-only, never UPDATE an entry | full audit trail, easy replication |
+    | Every transaction's entries sum to 0 | catches bugs instantly |
+    | Amounts as integers in minor units (cents) | no floating-point drift |
+    | Balance = materialised sum, rebuilt from entries | the entries are the truth |
+
+    Hot accounts (a merchant receiving 2,000 payments/s) serialise on one balance row. Fixes: split into N sub-accounts and sum on read, or batch entries and update the balance asynchronously while checking available funds against a conservative bound.
+
+    ### What interviewers probe
+    Where exactly the key is stored, what happens when two retries arrive concurrently (the primary key insert decides), and how you would detect a double charge that slipped through (reconciliation).
+  key_points:
+    - "Networks give at-most-once or at-least-once; exactly-once effect comes from at-least-once plus idempotent receivers."
+    - "An idempotency key is client-generated per logical action, stored with the response, and checked atomically on insert."
+    - "Kafka exactly-once only holds inside Kafka; external side effects still need idempotent writes."
+    - "Ledgers are append-only double-entry records in integer minor units; balances are derived, and reconciliation catches drift."
+  concepts: [idempotency-key, exactly-once-semantics, double-entry-ledger, reconciliation]

@@ -1,0 +1,178 @@
+slug: the-stale-profile
+kind: lab
+title: The stale profile
+difficulty: medium
+day: 8
+summary: Users change their profile and keep seeing the old one. A cache that never invalidates and lagging async replicas both serve old data. Make reads consistent, and pay for it in write latency.
+topics: [consistency, replication-lag, cache-invalidation, read-your-writes]
+company_tags: [LinkedIn, Meta, Discord]
+estimated_minutes: 25
+incident: "SEV-3 · support tickets: 'I changed my name and it still shows the old one' · stale reads 38%"
+
+brief_beginner: |
+  You run **Loopline**, a community app. People edit their profile (display name, photo, bio) and
+  then look at it. Lately the support inbox is full of the same complaint: *"I changed my name and it
+  still shows the old one."* Some users change it three times, thinking it did not save.
+
+  The site is fast, so what is wrong? Two things keep **copies** of profiles:
+  * **Redis**, a cache. When a profile changes, nobody deletes the old copy from Redis, so it is
+    served until it expires five minutes later.
+  * Two **read replicas**, copies of the database. They receive changes a moment after the main
+    database (asynchronously), so a read that lands on a replica right after a save can miss it.
+
+  Imagine a noticeboard in the lobby with photocopies in every corridor. You update the lobby board,
+  but the corridor copies are refreshed "when someone gets round to it". Making every copy update
+  before you walk away fixes it, but now each update takes longer.
+
+  **Your job:** stop serving outdated profiles. Watch what your fix does to response times, because
+  consistency is not free.
+
+brief_expert: |
+  3k rps, 86% reads (70% cacheable profile reads, 30% per-viewer queries), 14% writes. Cache-aside
+  Redis with `invalidate_on_write` off and a 300 s TTL serves stale entries for every hot profile
+  that changed (~38% of reads). PostgreSQL medium + 2 async replicas: ~1% replica lag, worse past
+  70% primary utilisation.
+
+  Target: stale reads ≤ 0.05%. Invalidate on write; then either synchronous replication (adds ~3 ms
+  × queueing factor to every commit, so it hurts more on a busy primary) or stop serving reads from
+  replicas (the primary then carries all reads). Check p99 under a write-heavy hour: synchronous
+  commit latency grows with primary load.
+
+glossary:
+  - term: Stale read
+    meaning: A read that returns an old version of data that has already been changed.
+  - term: Cache invalidation
+    meaning: Deleting (or updating) the cached copy when the real data changes, so the next read fetches the new version.
+  - term: Asynchronous replication
+    meaning: The primary confirms a write immediately and sends it to replicas afterwards. Fast, but replicas can briefly lag behind.
+  - term: Synchronous replication
+    meaning: The primary waits until replicas have the write before confirming it. No lag, but every write takes longer.
+  - term: Read-your-writes
+    meaning: A guarantee that after you change something, you will see your own change on the next read.
+
+requirements:
+  - Stale reads at or below 0.05%
+  - p99 latency under 65 ms at 3,000 req/s
+  - Error rate under 0.2%
+  - Stay within $1.90/hr
+
+budget: 1.90
+palette: [load_balancer, app_server, cache, database]
+
+starter:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 120}}
+    - {id: lb, type: load_balancer, label: Load Balancer, position: {x: 240, y: 120}}
+    - {id: api, type: app_server, label: Loopline API, config: {size: large, instances: 6}, position: {x: 480, y: 120}}
+    - {id: redis, type: cache, label: Redis, config: {memory_gb: "4", ttl_s: 300, invalidate_on_write: false}, position: {x: 720, y: 40}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: medium, replicas: 2, replication: async, indexes: "id, user_id"}, position: {x: 720, y: 200}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: redis}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 120}}
+    - {id: lb, type: load_balancer, label: Load Balancer, position: {x: 240, y: 120}}
+    - {id: api, type: app_server, label: Loopline API, config: {size: large, instances: 6}, position: {x: 480, y: 120}}
+    - {id: redis, type: cache, label: Redis, config: {memory_gb: "4", ttl_s: 300, invalidate_on_write: true}, position: {x: 720, y: 40}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: medium, replicas: 2, replication: sync, indexes: "id, user_id"}, position: {x: 720, y: 200}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: redis}
+    - {source: api, target: db}
+
+tests:
+  - id: normal
+    name: A normal afternoon
+    summary: 3,000 req/s, 14% profile edits
+    scenario: {base_rps: 3000, read_ratio: 0.86, cacheable: 0.7, working_set_gb: 2, query_column: user_id}
+    assertions:
+      - {metric: stale_read_rate, op: lte, value: 0.05}
+      - {metric: p99_ms, op: lte, value: 65}
+      - {metric: error_rate, op: lte, value: 0.2}
+  - id: redesign
+    name: Profile redesign launches
+    summary: Everyone updates their profile, writes rise to 22% of traffic
+    hidden: true
+    scenario: {base_rps: 3000, read_ratio: 0.78, cacheable: 0.7, working_set_gb: 2, query_column: user_id}
+    assertions:
+      - {metric: stale_read_rate, op: lte, value: 0.1}
+      - {metric: p99_ms, op: lte, value: 120}
+      - {metric: error_rate, op: lte, value: 0.5}
+  - id: evening
+    name: Evening peak
+    summary: Traffic rises 30% for 20 seconds
+    hidden: true
+    scenario:
+      base_rps: 3000
+      read_ratio: 0.86
+      cacheable: 0.7
+      working_set_gb: 2
+      query_column: user_id
+      spikes: [{at: 20, duration: 20, multiplier: 1.3, ramp: 4}]
+    assertions:
+      - {metric: stale_read_rate, op: lte, value: 0.05}
+      - {metric: p99_ms, op: lte, value: 85}
+      - {metric: error_rate, op: lte, value: 0.5}
+
+hints:
+  - The system is fast and error-free, so look at the stale reads number. Which components keep copies of a profile, and how does each copy learn about a change?
+  - Redis keeps serving the old profile until its TTL runs out. A shorter TTL only shrinks the window. Look at the cache's data settings for something that removes the entry when the row changes.
+  - Turn on invalidate-on-write in Redis. That still leaves about 0.2% stale reads from replicas that lag behind the primary. Switch replication to synchronous (or stop reading from replicas), then compare p99 before and after, especially when writes increase.
+
+editorial: |
+  ### Why it broke
+  Two separate copies were serving old data:
+
+  1. **The cache never invalidates.** With `invalidate_on_write` off, an edited profile stays in Redis
+     until its 300 s TTL expires. Hot profiles change often (14% of traffic is writes), so about
+     **38% of reads** return an outdated profile.
+  2. **Async replicas lag.** Two-thirds of the database reads go to replicas that apply changes a
+     moment late, about **1%** of those reads miss a recent write (more when the primary passes 70%
+     busy).
+
+  Nothing was slow or failing. That is what makes consistency bugs nasty: dashboards stay green while
+  users lose trust.
+
+  ### The fix, and its price
+  ```
+  Redis:      invalidate_on_write: true     (delete the key when the row changes)
+  PostgreSQL: replication: sync             (commit waits for replicas)
+  ```
+  Invalidation alone takes stale reads from **38% → 0.21%**. Synchronous replication removes the rest:
+  **0%**. Now look at latency:
+
+  | | async | sync |
+  |---|---|---|
+  | p99, normal afternoon | 49.5 ms | **54 ms** |
+  | p99, redesign launch (22% writes) | 79 ms | **104 ms** |
+
+  Every write now waits for both replicas, and that wait is multiplied by queueing on the primary. At
+  ~60% busy it costs a few milliseconds; at ~83% busy (the redesign launch) it costs about 25 ms at p99.
+  This is the consistency vs latency trade-off in miniature, the same one PACELC describes.
+
+  ### The trap
+  The hidden tests double the write share and add an evening spike. They catch two near-miss fixes:
+  * **A shorter TTL** instead of invalidation: a 5 s TTL still serves ~4% stale reads and drops the hit
+    ratio to ~62%, so the database works much harder.
+  * **Dropping the replicas** on the medium primary: it now serves every read and runs at ~97%; p99
+    goes to ~300 ms on a normal afternoon and requests fail during the redesign launch.
+
+  ### Alternatives
+  * **Read from the primary only, with a bigger primary.** A large primary without replicas passes too
+    (and costs less here), because it is fully consistent by definition. You give up read scale-out and
+    a warm standby.
+  * **Read-your-writes routing.** Send a user's own reads to the primary for a few seconds after they
+    write, and let everyone else read from async replicas. Most real systems do this; it keeps writes
+    fast and fixes the complaint that matters (seeing *your own* change).
+  * **Write-through caching** updates the cached value on write instead of deleting it. That is fine
+    for simple values, but racy when two writers overlap.
+
+  ### Interview takeaway
+  Name the consistency your users need (here: read-your-writes for your own profile), then pick the
+  cheapest mechanism that provides it. Always invalidate caches on write, and say out loud what
+  synchronous replication does to commit latency.

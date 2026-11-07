@@ -1,0 +1,148 @@
+slug: redirects-melting-the-database
+kind: lab
+title: Redirects are melting the database
+difficulty: easy
+day: 4
+summary: A read-heavy URL shortener pins PostgreSQL at 100%. Put a cache in front of it.
+topics: [caching, cache-aside, redis, read-heavy]
+company_tags: [Bitly, TinyURL]
+estimated_minutes: 20
+incident: "SEV-2 · p99 > 2 s on GET /r/:code · PostgreSQL CPU 100%"
+
+brief_beginner: |
+  You run **shrt.ly**, a link shortener. Someone opens `shrt.ly/abc123`, your API looks up
+  `abc123` in the database, finds the long URL and redirects them. Simple.
+
+  Today the service handles **4,000 redirects every second**, and almost all of them (98%) are
+  people *opening* links, not creating them. Every single open asks PostgreSQL the same kind of
+  question: *"where does `abc123` point?"*. The database is answering as fast as it can and
+  still falling behind, so people wait seconds for a redirect, and some give up.
+
+  Here is the useful observation: the **same few thousand links get most of the clicks** (a viral
+  post, a newsletter). The answers barely ever change. You are asking the database to look up the
+  same thing thousands of times a second.
+
+  **Your job:** keep the answers somewhere much faster than the database, so most requests never
+  reach it.
+
+brief_expert: |
+  Read-dominated workload: 4k rps, 98% `SELECT url FROM links WHERE code = $1` (indexed point
+  lookups), heavy Zipf skew, ~2 GB hot set. PostgreSQL (medium, ~1.5k qps) is saturated; queueing
+  drives p99 into seconds and app threads exhaust while blocked on it.
+
+  Introduce a cache-aside tier (API → Redis on the read path, API → PostgreSQL retained for misses
+  and writes). Size memory for the hot set, keep TTL long enough to hold a high hit ratio, and think
+  about what happens to the database the moment that cache is empty. A bigger database does not fit
+  the budget.
+
+glossary:
+  - term: Cache
+    meaning: A small, very fast store (in RAM) that keeps copies of answers you asked for recently.
+  - term: Cache-aside
+    meaning: The app checks the cache first. On a miss it asks the database, then saves the answer in the cache.
+  - term: Hit ratio
+    meaning: The share of requests the cache could answer. 95% means only 1 in 20 reaches the database.
+  - term: p99 latency
+    meaning: 99 out of 100 requests are faster than this. It describes your unluckiest users.
+
+requirements:
+  - p99 latency under 80 ms at 4,000 req/s
+  - Error rate under 0.2%
+  - Stay within $1.45/hr (an xlarge database does not fit)
+
+budget: 1.45
+palette: [load_balancer, app_server, database, cache]
+
+starter:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 120}}
+    - {id: lb, type: load_balancer, position: {x: 240, y: 120}}
+    - {id: api, type: app_server, label: API, config: {size: large, instances: 6}, position: {x: 480, y: 120}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: medium, indexes: "id, code"}, position: {x: 760, y: 120}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 120}}
+    - {id: lb, type: load_balancer, position: {x: 240, y: 120}}
+    - {id: api, type: app_server, label: API, config: {size: large, instances: 6}, position: {x: 480, y: 120}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: medium, indexes: "id, code"}, position: {x: 760, y: 200}}
+    - {id: redis, type: cache, label: Redis, config: {memory_gb: "4", ttl_s: 3600, stampede_protection: true}, position: {x: 760, y: 40}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: redis}
+    - {source: api, target: db}
+
+tests:
+  - id: normal
+    name: Normal redirects
+    summary: 4,000 req/s, 98% reads
+    scenario: {base_rps: 4000, read_ratio: 0.98, working_set_gb: 2, query_column: code}
+    assertions:
+      - {metric: p99_ms, op: lte, value: 80}
+      - {metric: error_rate, op: lte, value: 0.2}
+  - id: viral
+    name: A link goes viral
+    summary: Traffic climbs 30% for 20 seconds
+    hidden: true
+    scenario:
+      base_rps: 4000
+      read_ratio: 0.98
+      working_set_gb: 2
+      query_column: code
+      spikes: [{at: 20, duration: 20, multiplier: 1.3, ramp: 4}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 150}
+      - {metric: error_rate, op: lte, value: 0.5}
+  - id: cold-cache
+    name: Redis restarts mid-day
+    summary: The cache comes back empty at t=25s
+    hidden: true
+    scenario:
+      base_rps: 4000
+      read_ratio: 0.98
+      working_set_gb: 2
+      query_column: code
+      events: [{at: 25, type: cache_flush}]
+    assertions:
+      - {metric: error_rate, op: lte, value: 1.0}
+
+hints:
+  - Run the test and look at which box turns red. The API is fine; something behind it is not.
+  - The same links are read over and over and rarely change. Where could you keep those answers so the database never sees most of them?
+  - Add Redis and connect API → Redis (keep API → PostgreSQL for misses). Give it a long TTL. Then ask yourself what the database sees in the first seconds after Redis restarts, and look at Redis's resilience settings.
+
+editorial: |
+  ### Why it broke
+  PostgreSQL (medium) does roughly **1,500 indexed lookups per second**. You are sending it about
+  **4,000**. Past 100% utilisation a queue forms, every request waits behind the ones before it,
+  and latency grows without bound. API threads sit blocked on those slow queries, so the API starts
+  refusing requests too, even though its CPU is fine.
+
+  ### The fix: cache-aside
+  ```
+  GET /r/abc123
+    → Redis GET link:abc123        (~1 ms)
+       hit  → redirect
+       miss → SELECT … FROM links  (~3 ms) → Redis SET link:abc123 (TTL 1 h) → redirect
+  ```
+  With a 2 GB hot set and 4 GB of Redis, about **97% of reads hit**. The database now sees
+  ~120 reads/s plus ~80 writes/s: around 15% busy.
+
+  ### The trap: an empty cache
+  When Redis restarts, every request misses at once and all 4,000/s land on a database sized for
+  ~200/s. That is a **cache stampede**. *Request coalescing* (one request fetches a key, the
+  others wait for it) cuts the miss storm by ~75% while the cache warms up. Other real-world
+  options: warm the cache before taking traffic, or keep database headroom for the cold-start case.
+
+  ### Why not just a bigger database?
+  An xlarge (8k qps) would survive, but it costs about twice as much, still runs every redirect
+  through disk-backed queries, and buys you nothing when traffic doubles again.
+
+  ### Interview takeaway
+  For read-heavy, skewed, rarely-changing data: cache-aside, size for the hot set, long TTL with
+  explicit invalidation, and a plan for cold starts.

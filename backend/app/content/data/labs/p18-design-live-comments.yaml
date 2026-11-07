@@ -1,0 +1,248 @@
+slug: design-live-comments
+kind: problem
+title: Design live comments
+difficulty: hard
+day: 18
+summary: Comments on a live stream with millions of viewers. Absorb the read fan-out with a cache, smooth comment bursts with a queue, and keep reads alive when the cache goes cold.
+topics: [fan-out, server-sent-events, websockets, hot-keys, caching, message-queue, read-replicas, multi-region]
+company_tags: [Facebook Live, YouTube Live, Twitch, TikTok LIVE, LinkedIn]
+estimated_minutes: 45
+incident: "Launch review · 20M concurrent viewers at peak · design due Friday"
+
+brief_beginner: |
+  You are building the comment strip that scrolls next to a **live video**: a football match,
+  a concert, a product launch. Viewers type a comment and, a moment later, everyone else watching
+  sees it slide in.
+
+  Two things make this hard:
+
+  - **Very few people write, almost everyone reads.** One comment has to reach every viewer of that
+    stream. When one stream has millions of viewers, a single comment turns into millions of
+    deliveries. Engineers call this **fan-out**.
+  - **Traffic is not spread evenly.** One huge stream (the final of a tournament) can attract most of
+    the viewers at once. That stream is a **hot key**: one item that gets far more traffic than the
+    rest. And when something exciting happens on screen, everyone comments in the same few seconds,
+    so traffic suddenly doubles.
+
+  Right now every viewer's request for "the latest comments" goes straight to one PostgreSQL
+  database, and so does every new comment. The database cannot keep up even on a normal evening.
+
+  **Your job:** build a comment service that serves the latest comments from somewhere fast, accepts
+  new comments without letting a burst knock the database over, and keeps working when the fast
+  layer restarts. Then write down how comments actually get pushed to viewers' screens.
+
+brief_expert: |
+  **Functional:** post a comment to a live stream; viewers receive new comments for the stream they
+  are watching within ~2 s; a joining viewer sees the most recent ~50 comments; basic moderation
+  (delete, hide) propagates to viewers.
+
+  **Non-functional:** 20M concurrent viewers at peak across ~100k live streams, Zipf-distributed;
+  the top stream can hold 5M viewers (60% of the traffic in this region). Comment rate ~1k/s on a
+  hot stream normally, 5–10x for a few seconds after a goal. Delivery p99 under 2 s, post ack p99
+  under 200 ms. Ordering per stream is best effort; losing an occasional comment under extreme load
+  is acceptable, losing the service is not. Multi-region: viewers are global.
+
+  **Graded part:** one regional comment API at 4,000 req/s, 75% reads (fetch-latest / reconnect
+  backfill for a stream, cacheable, ~3 GB hot set), 25% posts. Bursts double traffic for ~30 s.
+  Keep the API tier as sized; the budget rules out solving it with one oversized database.
+
+glossary:
+  - term: Fan-out
+    meaning: One event that has to be delivered to many receivers. One comment, five million viewers.
+  - term: Hot key
+    meaning: A single item (here, one stream) that receives a large share of all traffic, so whatever stores it gets overloaded first.
+  - term: SSE (Server-Sent Events)
+    meaning: A long-lived HTTP response the server keeps writing to. Simple one-way push from server to browser.
+  - term: WebSocket
+    meaning: A long-lived two-way connection between browser and server. More flexible than SSE, more work to run.
+  - term: Message queue
+    meaning: A durable waiting line. The API drops a comment in and replies at once; background workers save it at a pace the database can handle.
+
+requirements:
+  - "Normal evening: p99 under 45 ms, error rate under 0.5% at 4,000 req/s"
+  - Comments keep flowing through bursts and cache restarts (hidden tests)
+  - Stay within $3.30/hr (the API tier stays at 11 large instances)
+
+budget: 3.3
+palette: [load_balancer, app_server, database, cache, queue, worker]
+
+starter:
+  nodes:
+    - {id: users, type: users, label: Viewers, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Comment API, config: {size: large, instances: 11}, position: {x: 480, y: 160}}
+    - {id: db, type: database, label: Comments DB, config: {size: large, indexes: "id, stream_id"}, position: {x: 720, y: 160}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, label: Viewers, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Comment API, config: {size: large, instances: 11}, position: {x: 480, y: 160}}
+    - {id: redis, type: cache, label: Recent comments, config: {memory_gb: "4", ttl_s: 30, stampede_protection: true}, position: {x: 720, y: 20}}
+    - {id: queue, type: queue, label: Comment log, config: {partitions: 4}, position: {x: 720, y: 300}}
+    - {id: workers, type: worker, label: Comment writers, config: {size: large, instances: 2}, position: {x: 960, y: 300}}
+    - {id: db, type: database, label: Comments DB, config: {size: large, replicas: 1, indexes: "id, stream_id"}, position: {x: 1200, y: 160}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: redis}
+    - {source: api, target: db}
+    - {source: api, target: queue}
+    - {source: queue, target: workers}
+    - {source: workers, target: db}
+
+tests:
+  - id: normal
+    name: A normal match night
+    summary: 4,000 req/s, 75% fetch-latest, one stream draws 60% of viewers
+    scenario: {base_rps: 4000, read_ratio: 0.75, cacheable: 0.97, hot_key_share: 0.6, working_set_gb: 3, query_column: stream_id}
+    assertions:
+      - {metric: p99_ms, op: lte, value: 45}
+      - {metric: error_rate, op: lte, value: 0.5}
+  - id: goal-burst
+    name: Goal in the final minute
+    summary: Traffic doubles for 30 seconds as everyone comments at once
+    hidden: true
+    scenario:
+      base_rps: 4000
+      read_ratio: 0.75
+      cacheable: 0.97
+      hot_key_share: 0.6
+      working_set_gb: 3
+      query_column: stream_id
+      spikes: [{at: 15, duration: 30, multiplier: 2, ramp: 4}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 125}
+      - {metric: error_rate, op: lte, value: 1.0}
+      - {metric: queue_lag_s, op: lte, value: 10}
+      - {metric: write_loss_rate, op: lte, value: 0}
+  - id: cache-restart-at-peak
+    name: Cache node restarts mid-burst
+    summary: Redis comes back empty at t=25 s while traffic is 60% above normal
+    hidden: true
+    scenario:
+      base_rps: 4000
+      read_ratio: 0.75
+      cacheable: 0.97
+      hot_key_share: 0.6
+      working_set_gb: 3
+      query_column: stream_id
+      spikes: [{at: 15, duration: 30, multiplier: 1.6, ramp: 4}]
+      events: [{at: 25, type: cache_flush}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 80}
+      - {metric: error_rate, op: lte, value: 0.5}
+
+hints:
+  - >-
+    Run the visible test and read the failure reasons. The API has spare CPU; its threads are stuck
+    waiting on PostgreSQL. Three quarters of the traffic asks the same question ("what are the latest
+    comments on stream X?"), and the answer is shared by every viewer of that stream. Where should
+    that answer live?
+  - >-
+    Put Redis next to the API (API → Redis and keep API → PostgreSQL for misses). That fixes the
+    normal night. Now picture the goal: comment posts double for half a minute. Those writes all land
+    on the primary. A queue with a fixed pool of workers turns a spike into a short delay instead of
+    an overload, as long as the workers drain slower than the database's limit and faster than the
+    average comment rate.
+  - >-
+    The last hidden test empties Redis while traffic is 60% above normal. Every read misses at once.
+    Coalescing (stampede protection) cuts the miss storm, and a read replica gives those misses
+    somewhere to go besides the primary that is also absorbing the worker writes. Check that the
+    primary stays under ~90% in that moment.
+
+editorial: |
+  ### 1. Requirements (5 minutes)
+  Pin down: delivery latency target (~2 s is fine, this is not chat), whether every viewer must see
+  every comment (no: at 5M viewers nobody can read 1,000 comments a second), ordering (per stream,
+  best effort), moderation (deletes must propagate), and whether replays need comments (yes, store
+  them durably with a stream offset).
+
+  ### 2. Estimation
+  - 20M concurrent viewers, ~100k streams, top stream 5M viewers.
+  - Posting: if 1% of a hot stream's viewers comment once a minute, that is 5M × 0.01 / 60 ≈ **830
+    comments/s**; after a goal, 5–10x for a few seconds.
+  - Naive fan-out on the hot stream: 830 × 5M ≈ **4 billion deliveries/s**. Impossible and useless,
+    since a human reads maybe 5–10 comments a second. So the system **samples**: each viewer gets at
+    most ~10 comments/s (friends' comments and highly ranked ones first). That is 5M × 10 = 50M
+    messages/s for one stream, ~10 GB/s at 200 bytes, served from the edge.
+  - Connections: 20M open SSE/WebSocket connections at ~50k per gateway node ≈ **400 gateway nodes**.
+  - Storage: 1k comments/s × 300 B ≈ 26 GB/day. Small. The hard part is delivery, not storage.
+
+  ### 3. High-level design
+  ```
+  post:    client → Comment API → comment log (Kafka, partition by stream_id) → writers → DB
+                                                                └→ fan-out service
+  deliver: fan-out service → regional pub/sub (per stream channel) → gateway nodes → SSE → viewers
+  join:    client → Comment API → Redis "recent:{stream}" (last 50) → DB on miss
+  ```
+  Gateways keep a local map `stream_id → set(connections)`. Each gateway subscribes once per
+  stream it has viewers for, so a comment is published **once per gateway**, not once per viewer.
+  For 5M viewers on 100 gateways, one comment becomes 100 pub/sub messages and the gateways do the
+  last-mile fan-out in memory.
+
+  ### 4. Deep dives
+  - **SSE vs WebSockets vs polling.** Viewers mostly receive; posting is rare and can be a normal
+    POST. SSE gives server push over plain HTTP, works through proxies and HTTP/2, and reconnects
+    with `Last-Event-ID` so a client can resume from its last offset. WebSockets add two-way framing
+    you do not need here and are harder to load-balance. Long polling is the fallback for clients
+    behind hostile proxies; it is exactly the "fetch latest since cursor" read in the graded part,
+    which is why the cache matters.
+  - **Hot streams.** Partition the comment log by `stream_id`, but split a hot stream across several
+    partitions (or salt the key) so one stream does not pin one broker. On the delivery side, a hot
+    stream is fine: it simply has subscribers on every gateway.
+  - **Bursts.** Accept the post fast (ack after the log write), apply per-user rate limits, and let
+    the fan-out service sample and batch (send one frame with 5 comments every 500 ms instead of 5
+    frames). Under extreme load, drop low-ranked comments from fan-out but still persist them.
+  - **Multi-region.** Viewers connect to the nearest region. A comment is written in the poster's
+    region and replicated cross-region on the log (MirrorMaker or equivalent). Each region runs its
+    own fan-out and gateways, so the 50M msg/s never crosses an ocean; only the 1k comments/s does.
+    Per-stream ordering across regions is best effort (use a hybrid timestamp + region id).
+  - **Moderation.** Deletes are events on the same channel; clients hide the comment id. Redis
+    "recent" lists are updated by the same writer.
+
+  ### 5. What the hidden tests probe
+  - **Goal burst (2x for 30 s).** Without a queue, posts hit the primary directly and it runs at
+    ~97%, so p99 climbs past 250 ms. With a queue and two workers draining ~1,500 writes/s, the
+    primary stays under 80% and comments are persisted ~8 s late at worst. That delay is the
+    trade-off you should name.
+  - **Cache restart at peak.** All reads miss at once. Stampede protection collapses duplicate misses
+    for the same stream key, and the replica takes half of the remaining reads. Without the replica
+    the primary, already carrying worker writes, saturates.
+
+  ### 6. Common mistakes
+  - Fanning out per viewer from the API servers (4 billion writes/s on paper).
+  - Storing per-viewer inboxes, as in a news feed. Live comments are ephemeral and shared, so fan-out
+    on read from a per-stream buffer is the right model.
+  - Choosing WebSockets "because real-time" without discussing connection cost, proxies or resume.
+  - Forgetting that the hot stream is both a read hot key and a write hot key.
+
+  ### 7. What good looks like
+  - **E4:** correct API (`POST /streams/{id}/comments`, `GET /streams/{id}/comments?since=`), a
+    cache for recent comments, a push channel, a queue in front of the database.
+  - **E5:** gateway tier with per-stream subscriptions, the numbers showing why per-viewer fan-out
+    fails, SSE with resume, burst handling via queue and sampling, hot-stream partitioning.
+  - **E6:** delivery as a ranked, rate-limited stream per viewer; regional fan-out with only the raw
+    comment stream replicated; explicit degradation ladder (sample, batch, drop from fan-out but
+    persist); capacity plan for gateways and pub/sub; how to test it (synthetic 5M-viewer load).
+
+design_prompt: |
+  Answer each in a few sentences or a short sketch. Use numbers where you can.
+
+  1. **API and delivery protocol.** Define the endpoints for posting a comment and for receiving
+     comments on a stream. Choose between SSE, WebSockets and long polling for delivery, and explain
+     how a client that reconnects after a network blip resumes without gaps or duplicates.
+  2. **Fan-out for a hot stream.** A stream has 5M viewers and receives 1,000 comments/s. Estimate
+     the naive fan-out, then describe how your design delivers comments (gateway subscriptions,
+     sampling, batching) and how many messages per second each component handles.
+  3. **Data model and storage.** What do you store for a comment, how is it keyed and partitioned,
+     and what lives in the cache versus the durable store? How does a viewer joining mid-stream get
+     the last 50 comments?
+  4. **Bursts and backpressure.** Traffic jumps 5–10x for a few seconds after a goal. Walk through
+     what happens at each tier, what you degrade first, and what the viewer experiences.
+  5. **Multi-region.** Viewers are spread across three continents. Where are comments written, how
+     do they reach viewers in other regions, and what ordering guarantee do you offer?

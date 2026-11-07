@@ -1,0 +1,170 @@
+slug: the-viral-spike
+kind: lab
+title: The viral spike
+difficulty: medium
+day: 6
+summary: A surprise tour announcement triples traffic for the rest of the evening. Fixed capacity is either too small or too expensive. Autoscale, and keep enough baseline to survive the boot time.
+topics: [autoscaling, horizontal-scaling, capacity-planning, cost]
+company_tags: [Ticketmaster, Netflix, Amazon]
+estimated_minutes: 25
+incident: "SEV-2 · 18% of requests failing on Ticketnest seat map · API CPU 159% · traffic 3x baseline"
+
+brief_beginner: |
+  You run **Ticketnest**, a ticketing site. Every request renders a live seat map, so each one takes
+  a fair amount of computer effort. On a normal evening **600 people per second** browse the site
+  and seven servers handle it comfortably.
+
+  Tonight a famous band announced a surprise tour on live TV. Over about a minute and a half,
+  traffic climbs to **three times** normal and stays there. Seven servers cannot keep up, and about
+  one request in six fails.
+
+  You could simply run fifteen servers all the time, but you would pay for them every quiet night of
+  the year. **Autoscaling** adds servers automatically when they get busy. The catch is that a new
+  server takes about **20 seconds** to start, like calling in extra staff who need time to get to
+  work. The servers you already have must cope on their own until help arrives.
+
+  **Your job:** turn on autoscaling with a sensible upper limit, and keep enough servers running at
+  the start to survive the wait, all within a budget that rules out running at peak size all the time.
+
+brief_expert: |
+  Baseline 600 rps, CPU-heavy handlers (`app_work` 3, so a medium instance serves ~167 rps). Traffic
+  ramps 1x → 3x over 90 s starting at t=60 and holds to the end of the run: peak ~1.85k work units,
+  ~11 instances at 100%. Static fleet of 7 saturates at ~1.9x.
+
+  The autoscaler targets 60% CPU, evaluates every 5 s and needs 20 s to boot, so effective capacity
+  lags demand by ~25 s. It never scales in during the run, and you pay for booting instances. Fixed
+  provisioning for peak (14–15 instances) exceeds the budget. Choose a baseline that absorbs ~25 s of
+  ramp growth and a max that covers peak at target utilisation. Expect steeper ramps and instance loss.
+
+glossary:
+  - term: Autoscaling
+    meaning: Automatically adding servers when they are busy (and, in real systems, removing them when traffic drops).
+  - term: Boot time
+    meaning: How long a new server takes to start and accept traffic. Here, about 20 seconds.
+  - term: Baseline
+    meaning: The number of servers you keep running at all times, before the autoscaler adds any.
+  - term: Target utilisation
+    meaning: How busy the autoscaler tries to keep each server. Here it adds servers when CPU passes 60%.
+  - term: Over-provisioning
+    meaning: Running enough servers for your worst moment all the time. Safe, but you pay for idle machines.
+
+requirements:
+  - p99 latency under 90 ms while traffic triples
+  - Error rate under 0.5%
+  - Stay within $1.58/hr (running at peak size all evening does not fit)
+
+budget: 1.58
+palette: [load_balancer, app_server, database]
+
+starter:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 120}}
+    - {id: lb, type: load_balancer, label: Load Balancer, position: {x: 240, y: 120}}
+    - {id: api, type: app_server, label: Seat Map API, config: {size: medium, instances: 7}, position: {x: 480, y: 120}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: large}, position: {x: 720, y: 120}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 120}}
+    - {id: lb, type: load_balancer, label: Load Balancer, position: {x: 240, y: 120}}
+    - {id: api, type: app_server, label: Seat Map API, config: {size: medium, instances: 9, autoscaling: true, max_instances: 24}, position: {x: 480, y: 120}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: large}, position: {x: 720, y: 120}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: db}
+
+tests:
+  - id: tour-announced
+    name: Tour announced on live TV
+    summary: Traffic triples over 90 seconds from t=60s and stays there
+    scenario:
+      duration: 180
+      base_rps: 600
+      read_ratio: 0.9
+      app_work: 3
+      spikes: [{at: 60, duration: 120, multiplier: 3, ramp: 90}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 90}
+      - {metric: error_rate, op: lte, value: 0.5}
+  - id: presale-opens
+    name: Presale link goes out
+    summary: Traffic triples over 60 seconds instead of 90
+    hidden: true
+    scenario:
+      duration: 180
+      base_rps: 600
+      read_ratio: 0.9
+      app_work: 3
+      spikes: [{at: 80, duration: 100, multiplier: 3, ramp: 60}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 110}
+      - {metric: error_rate, op: lte, value: 0.5}
+  - id: instances-die
+    name: Three servers crash at peak
+    summary: Three API instances die at t=160s, at full traffic
+    hidden: true
+    scenario:
+      duration: 180
+      base_rps: 600
+      read_ratio: 0.9
+      app_work: 3
+      spikes: [{at: 60, duration: 120, multiplier: 3, ramp: 90}]
+      events: [{at: 160, type: kill_app_instance, count: 3}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 95}
+      - {metric: error_rate, op: lte, value: 0.55}
+
+hints:
+  - Work out how many instances peak traffic needs. One medium instance serves about 167 of these requests per second, and peak is about 1,800. Then price that fleet against the budget.
+  - Turn on autoscaling on the API. Look at its maximum instance count; the default may be far below what peak needs at 60% CPU. Then watch the logs to see when new instances actually become ready.
+  - Set the maximum to about 24 and raise the starting count to about 9. A new instance takes 20 seconds to boot, so the servers you start with must carry roughly 25 seconds of traffic growth on their own. A faster ramp than this one is coming.
+
+editorial: |
+  ### Why it broke
+  Each request renders a seat map, so it costs 3× the usual CPU: a medium instance serves about
+  **167 req/s**. Seven instances give ~**1,170 req/s**. Peak traffic is **1,800 req/s**
+  (~1,850 units with writes), so the fleet runs at **159%** at peak and **18% of requests fail**.
+
+  ### Why not just run 15 servers?
+  Fifteen fixed instances pass (p99 ≈ 73 ms) but cost **$1.70/hr**, and you pay that every quiet
+  night. Fourteen cost $1.61/hr and still miss the latency target (≈ 91 ms, 79% busy at peak). Thirteen
+  fit the budget but run at 86% and p99 reaches ≈ 128 ms. Fixed capacity is a bet on your worst
+  evening.
+
+  ### The fix: autoscaling with a real baseline
+  ```
+  API: medium × 9, autoscaling on, max 24   (60% CPU target, 20 s boot)
+  ```
+  Two settings matter:
+  * **Max instances.** At 60% CPU, 1,850 units need ⌈1,850 ÷ (167 × 0.6)⌉ = **19** instances. The
+    default max of 10 caps you at ~1,670 req/s, below peak.
+  * **Baseline.** The autoscaler reacts to *current* load and new instances are ready ~20–25 s later.
+    During a 90-second ramp, load grows by about half the baseline traffic in that window. Start with
+    7 and the fleet runs hot while help is booting; start with **9** and it rides the gap.
+
+  Result: p99 ≈ **75 ms**, no errors, **$1.50/hr** averaged over the run (fewer instances during the
+  quiet first minute, 19–20 at the end).
+
+  ### The trap: the boot gap
+  The hidden tests use a **60-second ramp** and kill **three instances at peak**. With a baseline of 7,
+  the faster ramp pushes p99 to ~135 ms; with 9 it stays at ~94 ms. When instances die the autoscaler
+  launches replacements, and health checks pull the dead ones out within ~3 s, so errors stay below
+  0.5%. Autoscaling is not instant capacity: it is capacity that arrives one boot time late.
+
+  ### Alternatives
+  * **Scheduled scaling** (scale up before a known event) beats reactive scaling when you know the
+    date, but a surprise announcement gives no warning.
+  * **A lower CPU target** (say 40%) reacts earlier at the cost of more idle capacity.
+  * **Faster boots** (pre-baked images, warm pools) shrink the gap itself. That is often the best
+    investment.
+  * **Load shedding / a waiting room** protects the core flow when even autoscaling cannot keep up.
+
+  ### Interview takeaway
+  Autoscaling saves money on average and still needs headroom at the instant of a spike: baseline ≥
+  traffic growth during (evaluation interval + boot time). Always state the max, the target
+  utilisation and what happens in the first 30 seconds.

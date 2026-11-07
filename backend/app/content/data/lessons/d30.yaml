@@ -1,0 +1,58 @@
+- slug: putting-it-all-together
+  day: 30
+  title: Putting it all together
+  minutes: 12
+  summary: "A capstone recap that maps every symptom you have met in thirty days to its cause and fix, plus a triage order for the day everything breaks at once."
+  plain: |
+    Over thirty days you have collected a toolbox: more machines, a CDN, indexes, caches, replicas, queues, failover, rate limits, timeouts and circuit breakers, sharding, consensus, sagas and more. Real outages rarely need one tool. They arrive as a pile of symptoms at once — slow pages, errors, a database at 100%, a queue growing — and the skill is deciding what to do first.
+
+    Think of a hospital emergency room. Patients arrive together, and the staff do not treat them in arrival order. They **triage**: stop the bleeding first, then stabilise breathing, then deal with the broken arm. Some problems kill in minutes; others can wait an hour. Fixing the broken arm while someone bleeds is a mistake even if the arm fix is perfect.
+
+    For systems, the triage order is roughly:
+    1. **Stop the bleeding**: shed or block traffic that should not be there (bots, retry storms) and protect the database, which is the hardest part to recover.
+    2. **Restore service**: fail over dead components, add capacity where the bottleneck is, let caches warm.
+    3. **Restore correctness**: make sure no data was lost or duplicated; reconcile.
+    4. **Prevent recurrence**: fix the root cause and write down what you learned.
+
+    The final simulation hits your design with a traffic spike, a bot wave, a cache flush and a dead database primary in the same run. No single change survives all four. The design that passes is the one with layers: each layer catches what the one in front missed. That is the real lesson of the whole course — reliable systems are built from boring pieces arranged so that no single failure reaches the user.
+  deeper: |
+    ### Symptom to cause to fix
+    | Symptom | Likely cause | Fix (day) |
+    |---|---|---|
+    | p99 climbs with load, CPU high on app tier | app tier saturated | horizontal scaling and autoscaling, with ~20 s boot lag in mind (6) |
+    | DB at 100% on reads, low write rate | missing index (reads cost 15x) or no cache | add index (3); cache-aside (4); replicas (7) |
+    | Static assets eating capacity | no CDN | CDN serves ~95% of static at the edge (2) |
+    | Stale profile after an update | async replica lag, cache not invalidated on write | read-your-writes routing, invalidate on write (8, 4) |
+    | DB spike at a fixed time | TTL expiry wave or cache flush, stampede | jittered TTLs, request coalescing, stampede protection (9) |
+    | Write bursts drop requests | DB write ceiling | queue plus workers to smooth writes (10) |
+    | Permanent outage after primary death | no failover | replica plus failover: ~12 s blip instead of permanent loss (11) |
+    | Capacity gone, error rate looks fine | bot traffic | rate limit at the LB; tune strictness vs false positives (12, 20) |
+    | Errors snowball after a slow dependency | retries without backoff, no breaker | timeouts, capped retries with jitter, circuit breakers (13) |
+    | One shard hot, others idle | hot key or time-range shard key | split hot key, hash instead of range (21) |
+
+    ### Triage order under compound failure
+    1. **Edge first**: rate limits and caching at the CDN/LB cut load for everything behind them. Bots blocked at the LB never reach the DB.
+    2. **Protect state**: the database is the slowest to recover. Cache in front with stampede protection, queue in front of writes, failover with a replica.
+    3. **Elastic middle**: autoscaling for the app tier, with a floor high enough to survive the ~20 s boot lag at spike onset.
+    4. **Contain failure**: timeouts and breakers so one sick component does not drag down the rest.
+    5. **Check the budget**: the passing design is rarely the most expensive; it is the one where cheap layers do the most work.
+
+    ### The course in ten sentences
+    1. Requirements and numbers come before boxes.
+    2. Latency is a distribution; design for p99, not average.
+    3. Find the bottleneck by comparing load to capacity per hop; plan for 60–70% at peak.
+    4. Cache and CDN first, replicas second, sharding last.
+    5. Every copy of data creates a consistency question; answer it explicitly.
+    6. Queues turn spikes into lag; lag needs a bound and an alert.
+    7. Anything that can fail needs detection, failover and a tested recovery path.
+    8. Retries without backoff, jitter and idempotency make outages worse.
+    9. Hot keys defeat every even-spreading scheme; split them or cache them.
+    10. Every decision is a trade-off; say what you gave up.
+
+    In an interview, walk the failure table above against your own design. If you can say why each layer exists and what breaks without it, you are ready.
+  key_points:
+    - "Real incidents are compound; triage by stopping the bleeding, restoring service, restoring correctness, then preventing recurrence."
+    - "Layer defences from the edge inward: rate limits and CDN, cache and queue in front of the database, failover, autoscaling, breakers."
+    - "Map each symptom to its cause before acting; the same architecture has different bottlenecks under different events."
+    - "The passing design is usually not the most expensive, but the one where cheap layers absorb the most work."
+  concepts: [incident-triage, defense-in-depth, graceful-degradation, bottleneck-analysis, failover]

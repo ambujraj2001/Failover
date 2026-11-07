@@ -1,0 +1,256 @@
+slug: design-news-feed
+kind: problem
+title: Design a news feed
+difficulty: medium
+day: 15
+checkpoint: true
+summary: Design the Twitter/Instagram home timeline. Reads dwarf writes, timelines live in cache, and one celebrity post can knock the cache over.
+topics: [news-feed, fan-out, timeline-cache, read-replicas, hot-keys, message-queue, cdn]
+company_tags: [Meta, Twitter, Instagram, LinkedIn, Pinterest, Snap, TikTok]
+estimated_minutes: 50
+incident: "Launch review · 200M DAU · 10k req/s per cell at peak · design due Friday"
+
+brief_beginner: |
+  You are building the home feed for **Murmur**, a social app. When someone opens the app they
+  see a **timeline**: the newest posts from everyone they follow, mixed together. Opening the feed
+  happens constantly. Posting happens much less often: for every post, there are about
+  **twenty feed loads**.
+
+  Picture a newspaper printed separately for every reader. You can either print each reader's
+  paper the moment a story comes in (do the work when someone posts), or assemble it when the
+  reader asks (do the work when someone opens the app). Most people follow a few hundred
+  accounts, so printing ahead works well. But when a **celebrity** with 50 million followers
+  posts, "printing ahead" means 50 million papers at once.
+
+  At peak a single region handles **10,000 requests per second**. About 30% are images and
+  videos. Of the rest, 95% are feed reads. Today every feed load runs a query against one
+  database, which falls over long before peak.
+
+  Words you will need. A **CDN** stores images close to users so they never reach your servers. A
+  **cache** keeps ready-made timelines in fast memory. A **read replica** is a copy of the
+  database that can answer reads, taking load off the main one (the **primary**), which still
+  handles every write. A **queue** lets you hand off slow background work, such as copying a new
+  post into followers' timelines.
+
+  **Your job:** design a feed that loads fast at peak, keeps up with new posts, and survives the
+  moment a celebrity posts and millions of cached timelines need rebuilding at once.
+
+brief_expert: |
+  **Functional:** post (text + media), follow/unfollow, home timeline (reverse-chronological, with
+  room for ranking later), paginated by cursor.
+
+  **Non-functional:** timeline p99 < 120 ms, post visible to followers within ~5 s (eventual
+  consistency is fine), 99.95% availability, read:write ≈ 20:1.
+
+  **Scale:** 200M DAU × ~20 feed loads/day ≈ 4B timeline reads/day (~50k/s avg globally) and
+  ~200M posts/day. Average 200 followees; a long tail of accounts with 10M+ followers. Modelled cell
+  at peak: **10k rps, 30% media, 95% of dynamic requests are timeline reads**, ~85% of which
+  are served from precomputed timelines; the remaining 15% (deep pages, cache-bypassing filters)
+  hit the database. Writes are fan-out inserts after batching. Hot timeline set ≈ 24 GB.
+
+  The starter queries one PostgreSQL per feed load. Choose a fan-out strategy, precompute and cache
+  timelines, spread database reads, and move fan-out off the request path. The hidden tests include
+  a celebrity post that invalidates a large share of cached timelines, and a burst of posting.
+
+glossary:
+  - term: Fan-out on write (push)
+    meaning: When someone posts, copy the post ID into every follower's timeline straight away. Reads become a cheap lookup; posts by people with many followers become expensive.
+  - term: Fan-out on read (pull)
+    meaning: When someone opens the feed, fetch recent posts from everyone they follow and merge them. Posting is cheap; every read does more work.
+  - term: Hot key
+    meaning: One piece of data that a huge share of traffic touches at once, such as a celebrity's newest post. It overloads whichever single server holds it.
+  - term: Read replica
+    meaning: A copy of the database that serves reads. Writes still go to the primary and are copied over, usually a fraction of a second later.
+  - term: Cache stampede
+    meaning: Many requests miss the cache at the same moment and all hit the database together.
+
+requirements:
+  - Timeline p99 under 120 ms at 10,000 req/s
+  - Error rate under 0.5%
+  - Fan-out lag under 5 s
+  - Survive a celebrity post that invalidates most cached timelines, and a posting burst
+  - Stay within $4.20/hr
+
+budget: 4.2
+palette: [cdn, load_balancer, app_server, cache, database, queue, worker, object_storage]
+
+starter:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Feed API, config: {size: large, instances: 8}, position: {x: 480, y: 160}}
+    - {id: db, type: database, label: Posts DB, config: {size: large, indexes: "id, user_id"}, position: {x: 720, y: 160}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 160}}
+    - {id: cdn, type: cdn, label: CDN, position: {x: 240, y: 160}}
+    - {id: media, type: object_storage, label: Media, position: {x: 480, y: 320}}
+    - {id: lb, type: load_balancer, position: {x: 480, y: 80}}
+    - {id: api, type: app_server, label: Feed API, config: {size: large, instances: 12}, position: {x: 720, y: 80}}
+    - {id: redis, type: cache, label: Timeline cache, config: {memory_gb: "16", nodes: 2, ttl_s: 300, stampede_protection: true}, position: {x: 960, y: 0}}
+    - {id: queue, type: queue, label: Fan-out queue, config: {partitions: 4}, position: {x: 960, y: 320}}
+    - {id: workers, type: worker, label: Fan-out workers, config: {size: large, instances: 2}, position: {x: 1200, y: 320}}
+    - {id: db, type: database, label: Posts DB, config: {size: large, indexes: "id, user_id", replicas: 1}, position: {x: 1440, y: 160}}
+  edges:
+    - {source: users, target: cdn}
+    - {source: cdn, target: media}
+    - {source: cdn, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: redis}
+    - {source: api, target: db}
+    - {source: api, target: queue}
+    - {source: queue, target: workers}
+    - {source: workers, target: db}
+
+tests:
+  - id: peak-scroll
+    name: Evening scroll peak
+    summary: 10,000 req/s, 30% media, 95% of the rest are timeline reads
+    scenario:
+      base_rps: 10000
+      static_ratio: 0.3
+      read_ratio: 0.95
+      cacheable: 0.85
+      working_set_gb: 24
+      query_column: user_id
+    assertions:
+      - {metric: p99_ms, op: lte, value: 120}
+      - {metric: error_rate, op: lte, value: 0.5}
+      - {metric: queue_lag_s, op: lte, value: 5}
+  - id: celebrity-post
+    name: A celebrity posts
+    summary: Traffic up 30%, most cached timelines invalidated at t=25s, one account takes 40% of keyed traffic
+    hidden: true
+    scenario:
+      base_rps: 10000
+      static_ratio: 0.3
+      read_ratio: 0.95
+      cacheable: 0.85
+      working_set_gb: 24
+      hot_key_share: 0.4
+      query_column: user_id
+      spikes: [{at: 20, duration: 25, multiplier: 1.3, ramp: 3}]
+      events: [{at: 25, type: ttl_expiry_wave, label: "Celebrity post: millions of cached timelines invalidated at once"}]
+    assertions:
+      - {metric: error_rate, op: lte, value: 1.0}
+      - {metric: p99_ms, op: lte, value: 150}
+  - id: posting-burst
+    name: Final whistle
+    summary: A match ends and everyone posts. The posting rate triples and traffic rises 30% for 20 seconds
+    hidden: true
+    scenario:
+      base_rps: 10000
+      static_ratio: 0.3
+      read_ratio: 0.85
+      cacheable: 0.85
+      working_set_gb: 24
+      query_column: user_id
+      spikes: [{at: 20, duration: 20, multiplier: 1.3, ramp: 3}]
+    assertions:
+      - {metric: error_rate, op: lte, value: 0.5}
+      - {metric: p99_ms, op: lte, value: 150}
+      - {metric: queue_lag_s, op: lte, value: 10}
+      - {metric: write_loss_rate, op: lte, value: 0}
+
+hints:
+  - Separate the three kinds of traffic. Media can be served from the edge without touching your servers. Timeline reads are the bulk of the work. Posts are few but each one fans out to many timelines.
+  - Precompute timelines and keep them in Redis (App → Redis, App → Posts DB for misses). Size the cache for the 24 GB hot set. Even at a 97% hit ratio, the 15% of reads that bypass the cache still reach the database, so give reads more than one node to land on.
+  - Move fan-out off the request path (App → Queue → Workers → Posts DB) and size the workers for a burst of posting, not the average. Then imagine 85% of cached timelines vanishing at once after a celebrity post. What protects the database in those seconds?
+
+design_prompt: |
+  Answer in writing. Use numbers where you can.
+
+  1. **API.** Define `POST /posts`, `GET /feed` (with cursor pagination) and follow/unfollow. What does
+     a feed page return: full posts or IDs that the client hydrates? Why does cursor pagination beat
+     offset pagination for a feed that changes while you scroll?
+  2. **Data model.** Give the tables or key-value layouts for posts, the follow graph and precomputed
+     timelines, with partition keys. How large is one user's cached timeline (how many entries, how
+     many bytes) and how much memory does the whole hot set need?
+  3. **Fan-out strategy.** Push, pull or hybrid? State the threshold at which you switch an author
+     from push to pull and why. Walk through what happens when an account with 50M followers posts,
+     and how that post appears in a follower's feed.
+  4. **Hot keys and cache failure.** A celebrity post is read by millions within a minute, and
+     rebuilding cached timelines causes a wave of misses. How do you protect the cache and the
+     database (request coalescing, replicating hot keys, jittered TTLs, a local in-process cache)?
+  5. **Consistency.** A user posts and immediately refreshes their own feed. How do you guarantee
+     they see their post when timelines are built asynchronously and reads may hit a lagging
+     replica? What happens to cached timelines when someone unfollows or deletes a post?
+
+editorial: |
+  ### 1. Requirements
+  * **Functional:** post, follow, home timeline with cursor pagination.
+  * **Non-functional:** fast reads, eventual consistency for others' posts (seconds), read-your-own-
+    writes for the author, availability over consistency.
+
+  ### 2. Estimation
+  | quantity | value |
+  |---|---|
+  | timeline reads | 200M × 20 = 4B/day ≈ 46k/s avg, ~100k/s peak globally |
+  | posts | 200M/day ≈ 2.3k/s; × 200 followers ≈ 460k timeline inserts/s if pushed naively |
+  | timeline entry | post_id + author_id + ts ≈ 20 B; 800 entries per user ≈ 16 KB |
+  | hot set | active users in a cell × 16 KB ≈ 24 GB → two 16 GB Redis nodes |
+  | modelled cell | 10k rps: 3,000 media, 6,650 timeline reads, 350 fan-out writes/s |
+
+  ### 3. High-level design
+  ```
+  Users → CDN ─► Media (object storage)            images and video at the edge
+            └─► LB → Feed API ─┬─► Timeline cache (Redis, 2 × 16 GB)
+                               ├─► Posts DB (primary + replica) for misses and deep pages
+                               └─► Fan-out queue → workers → timelines / Posts DB
+  ```
+
+  ### 4. Why the starter fails
+  6,650 reads/s plus ~525 write units on one large PostgreSQL (3,500/s): twice its capacity. Eight
+  API instances are also short: ~7,100 units of work need ~12 large instances at 60%.
+
+  ### 5. Deep dives
+  **Hybrid fan-out.** Push for normal accounts: on post, workers append the post ID to each
+  follower's timeline list in Redis (capped at ~800 entries). Pull for accounts above a threshold
+  (say 1M followers): their posts are not fanned out; at read time the feed service merges the
+  precomputed timeline with recent posts from the few celebrities the user follows. This bounds
+  the worst-case fan-out cost and keeps reads cheap.
+
+  **Database reads.** With ~97% of cacheable reads hitting Redis, the database still sees ~1,000
+  uncacheable reads plus ~150 misses per second. Splitting them over primary + one replica keeps
+  the primary around 30% busy with writes included, leaving room for the bad minute.
+
+  **Celebrity post.** The hidden test drops the timeline cache hit ratio to 15% at the top of a 30%
+  surge. Without request coalescing, ~6,000 extra reads/s land on the database. With stampede
+  protection and a replica, the database peaks around 75% for a few seconds and recovers. Real-world
+  extras: replicate hot keys across cache nodes, add a small in-process cache for the hottest posts,
+  and jitter TTLs so expiries do not align.
+
+  **Hot shard.** If you shard posts by author, the celebrity's shard takes `0.4 + 0.6 / N` of the
+  traffic; splitting hot keys (or sharding timelines by reader rather than posts by author) avoids it.
+
+  **Read-your-writes.** Write the author's own post into their timeline synchronously (or merge
+  "my recent posts" at read time), and route the author's reads to the primary for a few seconds.
+
+  ### 6. What the hidden tests probe
+  * **Celebrity post:** cache-miss wave + surge. Fails without stampede protection, or with a single
+    large database and no replica (a bigger primary also works, but buys no failover).
+  * **Both hidden tests add a 30% surge.** Twelve API instances peak near 80%; ten pass the visible
+    test but blow the latency limit here.
+  * **Final whistle:** posting triples, peaking at ~1,400 fan-out writes/s during the 20 s surge. Two large workers drain
+    ~1,540/s, so the queue stays near empty. One worker drains ~770/s and the backlog grows to over
+    30 s of lag: followers see posts half a minute late. Size workers for the burst, and remember
+    their drain rate becomes write load on the primary.
+
+  ### 7. Common mistakes
+  * Pure push without a celebrity exception (one post → 50M writes).
+  * Pure pull at this read volume (each read merges hundreds of lists).
+  * Caching full post bodies in every timeline (memory explodes; store IDs and hydrate).
+  * Offset pagination on a constantly changing list.
+
+  ### 8. What good answers look like
+  * **E4:** cache timelines, push fan-out via a queue, replicas for reads, CDN for media.
+  * **E5:** hybrid fan-out with a stated threshold and the merge at read time; timeline sizing
+    in bytes; cursor pagination; read-your-writes for authors; stampede protection.
+  * **E6:** ranking pipeline (candidate generation, feature store, model scoring) and its latency
+    budget, backfill on follow and cleanup on unfollow, inactive-user optimisation (do not fan out to
+    users who have not logged in for 30 days), multi-region timelines, hot-key replication.

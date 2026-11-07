@@ -1,0 +1,57 @@
+phases:
+  - id: foundations
+    title: Foundations
+    days: [1, 2, 3, 4, 5]
+    description: What a request goes through, and the four tools that solve most problems — more machines, a CDN, an index and a cache.
+  - id: scaling
+    title: Scaling core
+    days: [6, 7, 8, 9, 10]
+    description: Survive traffic you did not plan for. Autoscaling, replicas, consistency, cache stampedes and queues.
+  - id: production
+    title: Production readiness
+    days: [11, 12, 13]
+    description: Things fail at 3 am. Failover, rate limiting, timeouts, retries and circuit breakers.
+  - id: case-studies
+    title: Case studies
+    days: [14, 15]
+    description: Put the pieces together on two systems everyone uses — chat and a social timeline.
+  - id: advanced
+    title: Advanced
+    days: [16, 17, 18, 19, 20, 21, 22, 23, 24]
+    description: Consensus, sagas, multi-region, observability, security and partitioning, through the classic interview problems.
+  - id: interview
+    title: Interview mode
+    days: [25, 26, 27, 28, 29, 30]
+    description: Practise the 45 minutes. Estimation, communication, scored mock interviews and a final simulation.
+
+days:
+  - {day: 1, phase: foundations, title: System design basics, theme: "Requirements, latency vs throughput, percentiles, availability", lessons: [requirements-first, latency-throughput-percentiles], lab: one-server-one-bad-day}
+  - {day: 2, phase: foundations, title: Networking, theme: "HTTP, DNS, TLS, load balancers and CDNs", lessons: [life-of-a-request, load-balancers-and-cdns], lab: static-files-choking-the-api}
+  - {day: 3, phase: foundations, title: Databases, theme: "SQL vs NoSQL, ACID, indexes", lessons: [sql-vs-nosql, indexes-and-query-plans], lab: the-missing-index}
+  - {day: 4, phase: foundations, title: Caching, theme: "Cache-aside, TTLs, eviction, invalidation", lessons: [caching-fundamentals, cache-invalidation], lab: redirects-melting-the-database}
+  - {day: 5, phase: foundations, title: Architecture checkpoint, theme: "Your first end-to-end design", lessons: [how-to-approach-a-design, back-of-the-envelope], lab: design-url-shortener}
+  - {day: 6, phase: scaling, title: Load and scaling, theme: "Stateless services, horizontal scaling, autoscaling", lessons: [vertical-vs-horizontal, autoscaling-in-practice], lab: the-viral-spike}
+  - {day: 7, phase: scaling, title: Database scaling, theme: "Read replicas, connection limits, read/write split", lessons: [read-replicas, scaling-writes], lab: reads-drowning-the-primary}
+  - {day: 8, phase: scaling, title: Replication and consistency, theme: "Sync vs async, lag, read-your-writes, CAP", lessons: [replication-lag, consistency-models], lab: the-stale-profile}
+  - {day: 9, phase: scaling, title: Advanced caching, theme: "Stampedes, hot keys, warming, eviction policies", lessons: [cache-stampedes, eviction-and-sizing], lab: stampede-at-the-top-of-the-hour}
+  - {day: 10, phase: scaling, title: Messaging, theme: "Queues, pub/sub, Kafka, backpressure", lessons: [queues-and-async-work, kafka-and-streams], lab: the-write-burst}
+  - {day: 11, phase: production, title: Reliability, theme: "Failover, redundancy, RTO and RPO", lessons: [redundancy-and-failover, slos-and-error-budgets], lab: primary-down-at-3am}
+  - {day: 12, phase: production, title: API design and protection, theme: "REST, pagination, idempotency, rate limiting", lessons: [api-design-essentials, rate-limiting], lab: the-scraper-flood}
+  - {day: 13, phase: production, title: Failure containment, theme: "Timeouts, retries, backoff, circuit breakers, bulkheads", lessons: [timeouts-and-retries, circuit-breakers-and-bulkheads], lab: the-retry-storm}
+  - {day: 14, phase: case-studies, title: "Case study: chat", theme: "WebSockets, ordering, delivery receipts, offline users", lessons: [real-time-connections, message-ordering-and-delivery], lab: design-chat-app}
+  - {day: 15, phase: case-studies, title: "Case study: timeline", theme: "Fan-out on write vs read, timeline caches, celebrities", lessons: [fan-out-strategies, timeline-caching], lab: design-news-feed}
+  - {day: 16, phase: advanced, title: Locks and consensus, theme: "Distributed locks, leader election, Raft, OT vs CRDT", lessons: [distributed-locks, consensus-and-raft], lab: design-google-docs}
+  - {day: 17, phase: advanced, title: Sagas and the outbox, theme: "Distributed transactions, idempotency keys, ledgers", lessons: [sagas-and-outbox, idempotency-and-exactly-once], lab: design-payment-system}
+  - {day: 18, phase: advanced, title: Multi-region and fan-out, theme: "Geo routing, active-active, SSE and hot streams", lessons: [multi-region-architecture, push-at-scale], lab: design-live-comments}
+  - {day: 19, phase: advanced, title: Observability and streams, theme: "Metrics, logs, traces, stream processing, sketches", lessons: [observability-basics, stream-processing-and-sketches], lab: design-top-k-trending}
+  - {day: 20, phase: advanced, title: Security, theme: "AuthN vs AuthZ, tokens, secrets, abuse prevention", lessons: [authentication-and-authorization, defending-against-abuse], lab: null}
+  - {day: 21, phase: advanced, title: Partitioning, theme: "Sharding, shard keys, hot partitions, consistent hashing", lessons: [sharding-and-shard-keys, consistent-hashing], lab: the-celebrity-shard}
+  - {day: 22, phase: advanced, title: Media at scale, theme: "Upload pipelines, transcoding, object storage, CDN", lessons: [blob-storage-and-media, video-delivery], lab: design-youtube}
+  - {day: 23, phase: advanced, title: Geo systems, theme: "Geo-indexes, geohash, matching, hot cells", lessons: [geospatial-indexing, real-time-matching], lab: design-uber}
+  - {day: 24, phase: advanced, title: Performance review, theme: "Profiling a system end to end under a hard day", lessons: [finding-the-bottleneck, cost-aware-design], lab: black-friday}
+  - {day: 25, phase: interview, title: The interview format, theme: "What interviewers score at E4, E5 and E6", lessons: [what-interviewers-look-for, the-45-minute-plan], lab: null}
+  - {day: 26, phase: interview, title: Estimation, theme: "Capacity math you can do out loud", lessons: [estimation-playbook, estimation-worked-examples], lab: null}
+  - {day: 27, phase: interview, title: Communication, theme: "Driving the conversation, trade-offs, deep dives", lessons: [communicating-trade-offs, handling-follow-ups], lab: null}
+  - {day: 28, phase: interview, title: Mock practice I, theme: "Timed design with a twist", lessons: [common-mistakes], lab: null}
+  - {day: 29, phase: interview, title: Mock practice II, theme: "Deep dives the bar raiser asks for", lessons: [deep-dive-checklist], lab: null}
+  - {day: 30, phase: interview, title: Final simulation, theme: "Everything breaks at once", lessons: [putting-it-all-together], lab: final-simulation}

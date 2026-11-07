@@ -1,0 +1,784 @@
+# Glossary of concepts used across the course.
+# area: one of the 12 mastery areas. lesson: slug from curriculum.yaml (or null).
+
+# ---------------------------------------------------------------- Fundamentals
+- slug: functional-requirements
+  name: Functional requirements
+  short: "What the system must do, stated as user-visible behaviours (for example 'shorten a URL', 'redirect a code'). They define the API surface and data model."
+  area: Fundamentals
+  aliases: [features, use cases, user stories]
+  lesson: requirements-first
+
+- slug: non-functional-requirements
+  name: Non-functional requirements
+  short: "Quality targets the system must meet regardless of features: scale, latency, availability, consistency, durability and cost. They drive almost every architectural choice."
+  area: Fundamentals
+  aliases: [NFRs, quality attributes, "-ilities"]
+  lesson: requirements-first
+
+- slug: latency-vs-throughput
+  name: Latency vs throughput
+  short: "Latency is how long one request takes; throughput is how many requests complete per unit time. A system can have high throughput and poor latency at the same time, especially near saturation."
+  area: Fundamentals
+  aliases: [response time, QPS, RPS, bandwidth]
+  lesson: latency-throughput-percentiles
+
+- slug: p99-latency
+  name: p99 latency
+  short: "The latency below which 99% of requests complete. Percentiles expose the slow tail that averages hide, and the tail is what users and SLOs feel."
+  area: Fundamentals
+  aliases: [percentile latency, p50, p95, p999, tail latency]
+  lesson: latency-throughput-percentiles
+
+- slug: tail-latency-amplification
+  name: Tail latency amplification
+  short: "When one request fans out to N backends, its latency is the slowest of N calls, so a rare backend slowdown becomes a common user slowdown. With 100 calls at 1% slow each, 63% of requests hit the slow path."
+  area: Fundamentals
+  aliases: [fan-out latency, slowest-of-N, hedged requests]
+  lesson: latency-throughput-percentiles
+
+- slug: availability-nines
+  name: Availability (nines)
+  short: "The fraction of time (or of requests) a system serves correctly, usually expressed in nines. 99.9% allows about 8.8 hours of downtime per year; 99.99% allows about 53 minutes."
+  area: Fundamentals
+  aliases: [uptime, nines, "99.9%", three nines, four nines]
+  lesson: latency-throughput-percentiles
+
+- slug: cursor-pagination
+  name: Cursor pagination
+  short: "Paging with an opaque cursor that encodes the last item seen, so each page is an index seek. Unlike OFFSET, cost does not grow with page depth and inserts do not shift results."
+  area: Fundamentals
+  aliases: [keyset pagination, seek pagination, offset pagination, page token]
+  lesson: api-design-essentials
+
+- slug: single-point-of-failure
+  name: Single point of failure
+  short: "Any component whose failure takes the whole system down. Removing SPOFs through redundancy is the first step toward high availability."
+  area: Fundamentals
+  aliases: [SPOF]
+  lesson: requirements-first
+
+# ---------------------------------------------------------------- Networking
+- slug: dns
+  name: DNS
+  short: "The distributed directory that resolves hostnames to IP addresses, cached at every layer according to record TTLs. Low TTLs enable fast failover at the cost of more lookups."
+  area: Networking
+  aliases: [domain name system, A record, CNAME, resolver]
+  lesson: life-of-a-request
+
+- slug: tls-handshake
+  name: TLS handshake
+  short: "The exchange that authenticates the server and agrees session keys before encrypted traffic flows. TLS 1.3 needs one round trip (zero on resumption), so terminating it close to users cuts latency."
+  area: Networking
+  aliases: [HTTPS, SSL, TLS termination, TLS 1.3]
+  lesson: life-of-a-request
+
+- slug: load-balancer
+  name: Load balancer
+  short: "A component that spreads incoming requests across a pool of healthy backends using a policy such as round robin or least connections. It also removes failed instances via health checks."
+  area: Networking
+  aliases: [LB, reverse proxy, round robin, least connections]
+  lesson: load-balancers-and-cdns
+
+- slug: l4-vs-l7-load-balancing
+  name: L4 vs L7 load balancing
+  short: "L4 balancers route TCP/UDP connections by address and port without reading payloads; L7 balancers parse HTTP and can route by path, header or cookie. L4 is cheaper and faster; L7 is smarter."
+  area: Networking
+  aliases: [layer 4, layer 7, application load balancer, network load balancer]
+  lesson: load-balancers-and-cdns
+
+- slug: cdn
+  name: CDN
+  short: "A network of edge caches near users that serves static and cacheable content without touching the origin. It cuts latency and absorbs most read bandwidth."
+  area: Networking
+  aliases: [content delivery network, edge cache, points of presence, PoP]
+  lesson: load-balancers-and-cdns
+
+- slug: websockets
+  name: WebSockets
+  short: "A protocol that upgrades an HTTP connection into a long-lived, full-duplex channel so the server can push messages at any time. Each connection pins state to one server, which complicates scaling and deploys."
+  area: Networking
+  aliases: [ws, persistent connection, full duplex]
+  lesson: real-time-connections
+
+- slug: server-sent-events
+  name: Server-sent events
+  short: "A one-way HTTP stream from server to client with built-in reconnection and event IDs. Simpler than WebSockets when clients only need to receive."
+  area: Networking
+  aliases: [SSE, EventSource, HTTP streaming]
+  lesson: push-at-scale
+
+- slug: long-polling
+  name: Long polling
+  short: "The client sends a request that the server holds open until data is available or a timeout fires, then the client immediately reconnects. A fallback for push when persistent connections are unavailable."
+  area: Networking
+  aliases: [comet, polling]
+  lesson: real-time-connections
+
+- slug: adaptive-bitrate-streaming
+  name: Adaptive bitrate streaming
+  short: "Video is transcoded into several bitrates and cut into short segments; the player picks the rendition for each segment based on measured bandwidth. HLS and DASH work this way over plain HTTP and CDNs."
+  area: Networking
+  aliases: [ABR, HLS, DASH, transcoding ladder, video segments]
+  lesson: video-delivery
+
+- slug: geo-routing
+  name: Geo routing
+  short: "Directing users to the nearest or healthiest region using GeoDNS or anycast. It reduces round-trip time and enables regional failover."
+  area: Networking
+  aliases: [GeoDNS, anycast, latency-based routing]
+  lesson: multi-region-architecture
+
+# ---------------------------------------------------------------- Storage
+- slug: acid-transactions
+  name: ACID
+  short: "Atomicity, consistency, isolation and durability: the guarantees a transactional database gives so that concurrent multi-row changes either fully apply or not at all and survive crashes."
+  area: Storage
+  aliases: [transactions, atomicity, isolation levels, durability]
+  lesson: sql-vs-nosql
+
+- slug: sql-vs-nosql
+  name: SQL vs NoSQL
+  short: "Relational databases offer schemas, joins and transactions; NoSQL stores (key-value, document, wide-column) trade some of those for simpler horizontal scaling and flexible schemas. Choose by access pattern, not fashion."
+  area: Storage
+  aliases: [relational, document store, key-value store, wide-column, Postgres vs DynamoDB]
+  lesson: sql-vs-nosql
+
+- slug: database-indexes
+  name: Database index
+  short: "A secondary data structure, usually a B-tree, that maps column values to rows so lookups take O(log n) instead of a full table scan. Indexes speed reads and slow writes."
+  area: Storage
+  aliases: [B-tree, secondary index, full table scan, seq scan]
+  lesson: indexes-and-query-plans
+
+- slug: composite-indexes
+  name: Composite index
+  short: "An index over several columns in a fixed order. It serves queries that filter on a leftmost prefix of those columns, so column order must match the query."
+  area: Storage
+  aliases: [multi-column index, leftmost prefix, covering index]
+  lesson: indexes-and-query-plans
+
+- slug: query-plans
+  name: Query plan
+  short: "The execution strategy the database optimizer picks for a query, visible with EXPLAIN. It reveals sequential scans, index usage and join order."
+  area: Storage
+  aliases: [EXPLAIN, EXPLAIN ANALYZE, execution plan, optimizer]
+  lesson: indexes-and-query-plans
+
+- slug: lsm-tree
+  name: LSM tree
+  short: "A write-optimized storage structure that buffers writes in memory and flushes sorted immutable files that are later compacted. Used by Cassandra, RocksDB and similar stores for high write throughput."
+  area: Storage
+  aliases: [log-structured merge tree, SSTable, memtable, compaction]
+  lesson: scaling-writes
+
+- slug: connection-pooling
+  name: Connection pooling
+  short: "Reusing a bounded set of database connections across requests. Databases like Postgres degrade with thousands of connections, so pools (or a proxy such as PgBouncer) cap concurrency."
+  area: Storage
+  aliases: [PgBouncer, connection limit, max_connections]
+  lesson: read-replicas
+
+- slug: object-storage
+  name: Object storage
+  short: "A flat, effectively unlimited store of immutable blobs addressed by key, with high durability and per-request latency in the tens of milliseconds. The default home for media and backups."
+  area: Storage
+  aliases: [blob storage, S3, GCS, presigned URL]
+  lesson: blob-storage-and-media
+
+# ---------------------------------------------------------------- Caching
+- slug: cache-aside
+  name: Cache-aside
+  short: "The application reads from the cache first; on a miss it reads the database and populates the cache. The most common caching pattern because the cache stays optional."
+  area: Caching
+  aliases: [lazy loading, look-aside cache, read-through]
+  lesson: caching-fundamentals
+
+- slug: write-through-cache
+  name: Write-through cache
+  short: "Every write updates the cache and the database synchronously, keeping the cache fresh at the cost of write latency."
+  area: Caching
+  aliases: [write-through]
+  lesson: caching-fundamentals
+
+- slug: write-back-cache
+  name: Write-back cache
+  short: "Writes go to the cache and are flushed to the database later. Very fast writes, but data is lost if the cache fails before the flush."
+  area: Caching
+  aliases: [write-behind]
+  lesson: caching-fundamentals
+
+- slug: ttl
+  name: TTL
+  short: "Time to live: how long a cached entry is considered valid before it expires. Short TTLs bound staleness; long TTLs raise hit ratio."
+  area: Caching
+  aliases: [time to live, expiry, expiration]
+  lesson: caching-fundamentals
+
+- slug: cache-invalidation
+  name: Cache invalidation
+  short: "Removing or updating cached entries when the source data changes. Delete-on-write is the usual approach; races between reads and writes can still reinsert stale data."
+  area: Caching
+  aliases: [invalidate on write, purge, stale cache]
+  lesson: cache-invalidation
+
+- slug: cache-hit-ratio
+  name: Cache hit ratio
+  short: "The fraction of reads served from cache. Backend load scales with the miss ratio, so going from 90% to 99% hits cuts database reads tenfold."
+  area: Caching
+  aliases: [hit rate, miss ratio, working set]
+  lesson: eviction-and-sizing
+
+- slug: lru-eviction
+  name: LRU eviction
+  short: "When the cache is full, evict the least recently used entry. LFU evicts the least frequently used instead and resists one-off scans."
+  area: Caching
+  aliases: [LRU, LFU, eviction policy, allkeys-lru]
+  lesson: eviction-and-sizing
+
+- slug: cache-stampede
+  name: Cache stampede
+  short: "Many concurrent misses on the same key or many keys expiring together all fall through to the database at once. Mitigated with request coalescing, locks, TTL jitter and early refresh."
+  area: Caching
+  aliases: [thundering herd, dogpile, request coalescing, single flight, TTL jitter]
+  lesson: cache-stampedes
+
+- slug: hot-key
+  name: Hot key
+  short: "A single cache or database key receiving a disproportionate share of traffic, overloading one node. Mitigated with local caching, key replication or splitting."
+  area: Caching
+  aliases: [hot spot, celebrity key, key splitting]
+  lesson: cache-stampedes
+
+- slug: cache-warming
+  name: Cache warming
+  short: "Pre-populating a cache before it takes traffic so a cold start does not dump the full read load onto the database."
+  area: Caching
+  aliases: [prewarm, cold cache, cold start]
+  lesson: eviction-and-sizing
+
+# ---------------------------------------------------------------- Scaling
+- slug: vertical-scaling
+  name: Vertical scaling
+  short: "Handling more load by moving to a bigger machine. Simple and keeps everything on one node, but has a hard ceiling and remains a single point of failure."
+  area: Scaling
+  aliases: [scale up, bigger box]
+  lesson: vertical-vs-horizontal
+
+- slug: horizontal-scaling
+  name: Horizontal scaling
+  short: "Handling more load by adding more machines behind a load balancer. Requires stateless services or partitioned state, but scales far and adds redundancy."
+  area: Scaling
+  aliases: [scale out, add instances]
+  lesson: vertical-vs-horizontal
+
+- slug: stateless-services
+  name: Stateless service
+  short: "A service that keeps no per-user state in local memory between requests, so any instance can serve any request. State lives in a database, cache or token."
+  area: Scaling
+  aliases: [stateless, sticky sessions, session store]
+  lesson: vertical-vs-horizontal
+
+- slug: autoscaling
+  name: Autoscaling
+  short: "Automatically adding or removing instances based on a metric such as CPU or queue depth. Boot time means it reacts in tens of seconds, so it cannot absorb instant spikes alone."
+  area: Scaling
+  aliases: [auto scaling group, HPA, scale out policy, warm pool]
+  lesson: autoscaling-in-practice
+
+- slug: read-replicas
+  name: Read replicas
+  short: "Copies of the primary database that serve read queries, multiplying read capacity. They do not add write capacity and usually lag the primary."
+  area: Scaling
+  aliases: [replica, follower, secondary, read scaling]
+  lesson: read-replicas
+
+- slug: read-write-split
+  name: Read/write split
+  short: "Routing writes to the primary and reads to replicas, often with exceptions that send read-after-write traffic to the primary."
+  area: Scaling
+  aliases: [query routing, primary/replica routing]
+  lesson: read-replicas
+
+- slug: fan-out-on-write
+  name: Fan-out on write
+  short: "When a user posts, push the item into every follower's precomputed timeline. Reads are cheap; writes for high-follower accounts are enormous."
+  area: Scaling
+  aliases: [push model, precomputed timeline, write fan-out]
+  lesson: fan-out-strategies
+
+- slug: fan-out-on-read
+  name: Fan-out on read
+  short: "Build a timeline at read time by merging recent posts from everyone the user follows. Writes are cheap; reads are expensive. Hybrid feeds use this for celebrities."
+  area: Scaling
+  aliases: [pull model, merge on read, hybrid fan-out]
+  lesson: fan-out-strategies
+
+# ---------------------------------------------------------------- Partitioning
+- slug: sharding
+  name: Sharding
+  short: "Splitting one dataset across multiple databases by a partition key so each shard holds and serves a subset. The main way to scale writes and storage beyond one node."
+  area: Partitioning
+  aliases: [partitioning, horizontal partitioning, shards]
+  lesson: sharding-and-shard-keys
+
+- slug: shard-key
+  name: Shard key
+  short: "The attribute that decides which shard a row lives on. A good key spreads load evenly and keeps common queries on one shard."
+  area: Partitioning
+  aliases: [partition key, routing key, distribution key]
+  lesson: sharding-and-shard-keys
+
+- slug: hash-vs-range-partitioning
+  name: Hash vs range partitioning
+  short: "Hash partitioning spreads keys evenly but breaks range scans; range partitioning keeps ranges together but concentrates sequential keys, such as timestamps, on one shard."
+  area: Partitioning
+  aliases: [range sharding, hash sharding, time-based partitioning]
+  lesson: sharding-and-shard-keys
+
+- slug: hot-partition
+  name: Hot partition
+  short: "A shard that receives far more traffic than others because of a skewed key, such as a celebrity user. The busiest shard caps the whole system's throughput."
+  area: Partitioning
+  aliases: [hot shard, celebrity problem, skew, key salting]
+  lesson: sharding-and-shard-keys
+
+- slug: consistent-hashing
+  name: Consistent hashing
+  short: "Placing nodes and keys on a hash ring so each key belongs to the next node clockwise. Adding or removing a node moves only about 1/N of the keys."
+  area: Partitioning
+  aliases: [hash ring, rendezvous hashing, minimal remapping]
+  lesson: consistent-hashing
+
+- slug: virtual-nodes
+  name: Virtual nodes
+  short: "Giving each physical node many positions on the hash ring to even out load and spread rebalancing across all nodes."
+  area: Partitioning
+  aliases: [vnodes, tokens]
+  lesson: consistent-hashing
+
+# ---------------------------------------------------------------- Replication & Consistency
+- slug: sync-vs-async-replication
+  name: Sync vs async replication
+  short: "Synchronous replication waits for replicas before acknowledging a write, so no acknowledged data is lost but writes are slower. Asynchronous replication acknowledges immediately and risks lag and loss on failover."
+  area: Replication & Consistency
+  aliases: [synchronous replication, asynchronous replication, semi-sync]
+  lesson: replication-lag
+
+- slug: replication-lag
+  name: Replication lag
+  short: "The delay between a write committing on the primary and becoming visible on a replica. Usually milliseconds, but grows to seconds or minutes under load."
+  area: Replication & Consistency
+  aliases: [replica lag, stale reads]
+  lesson: replication-lag
+
+- slug: read-your-writes
+  name: Read-your-writes consistency
+  short: "A guarantee that a user always sees their own recent writes, even if other users may see older data. Often implemented by reading from the primary briefly after a write."
+  area: Replication & Consistency
+  aliases: [read-after-write, session consistency, sticky reads]
+  lesson: consistency-models
+
+- slug: eventual-consistency
+  name: Eventual consistency
+  short: "If writes stop, all replicas converge to the same value eventually, with no bound on when. Reads in the meantime may return stale data."
+  area: Replication & Consistency
+  aliases: [BASE, convergence]
+  lesson: consistency-models
+
+- slug: linearizability
+  name: Linearizability
+  short: "The strongest single-object consistency model: every operation appears to take effect atomically at one instant between its start and end, so all clients see one up-to-date order."
+  area: Replication & Consistency
+  aliases: [strong consistency, atomic consistency]
+  lesson: consistency-models
+
+- slug: cap-theorem
+  name: CAP theorem
+  short: "During a network partition a distributed system must choose between consistency (refuse some requests) and availability (serve possibly stale data). Without a partition both are possible."
+  area: Replication & Consistency
+  aliases: [CAP, CP vs AP, partition tolerance, Brewer]
+  lesson: consistency-models
+
+- slug: pacelc
+  name: PACELC
+  short: "An extension of CAP: under a Partition choose Availability or Consistency; Else, in normal operation, choose Latency or Consistency."
+  area: Replication & Consistency
+  aliases: [latency vs consistency]
+  lesson: consistency-models
+
+- slug: quorum
+  name: Quorum
+  short: "With N replicas, a write waits for W acknowledgements and a read queries R replicas. If W + R > N, every read overlaps at least one replica holding the latest write."
+  area: Replication & Consistency
+  aliases: ["W + R > N", quorum reads, quorum writes, leaderless replication, Dynamo-style]
+  lesson: consistency-models
+
+- slug: active-active
+  name: Active-active replication
+  short: "Two or more regions accept writes simultaneously and replicate to each other. It gives local write latency and regional failover but requires conflict resolution."
+  area: Replication & Consistency
+  aliases: [multi-master, multi-leader, active-passive, last-writer-wins]
+  lesson: multi-region-architecture
+
+# ---------------------------------------------------------------- Async & Messaging
+- slug: message-queue
+  name: Message queue
+  short: "A durable buffer between producers and consumers that decouples them in time and absorbs bursts. Workers drain it at their own pace."
+  area: Async & Messaging
+  aliases: [queue, SQS, RabbitMQ, work queue, job queue]
+  lesson: queues-and-async-work
+
+- slug: pub-sub
+  name: Publish/subscribe
+  short: "Producers publish to a topic and every subscriber receives its own copy, unlike a work queue where each message goes to one consumer."
+  area: Async & Messaging
+  aliases: [pub/sub, topic, broadcast, SNS]
+  lesson: queues-and-async-work
+
+- slug: back-pressure
+  name: Back-pressure
+  short: "Signalling upstream to slow down when a downstream stage is saturated, instead of buffering without limit. Bounded queues, 429 responses and flow control are common forms."
+  area: Async & Messaging
+  aliases: [backpressure, flow control, load shedding, bounded queue]
+  lesson: queues-and-async-work
+
+- slug: kafka-partition
+  name: Kafka partition
+  short: "An ordered, append-only log that is Kafka's unit of parallelism and ordering. Messages with the same key go to the same partition, so order is guaranteed per key, not globally."
+  area: Async & Messaging
+  aliases: [Kafka, topic partition, commit log, offset]
+  lesson: kafka-and-streams
+
+- slug: consumer-group
+  name: Consumer group
+  short: "A set of consumers that share a topic's partitions so each partition is read by exactly one member. Parallelism is capped at the partition count."
+  area: Async & Messaging
+  aliases: [consumer lag, rebalance]
+  lesson: kafka-and-streams
+
+- slug: dead-letter-queue
+  name: Dead-letter queue
+  short: "A side queue for messages that repeatedly fail processing, so one poison message does not block the stream or retry forever."
+  area: Async & Messaging
+  aliases: [DLQ, poison message]
+  lesson: queues-and-async-work
+
+- slug: delivery-semantics
+  name: Delivery semantics
+  short: "At-most-once may lose messages; at-least-once may duplicate them; effectively-once is at-least-once delivery plus idempotent processing."
+  area: Async & Messaging
+  aliases: [at-least-once, at-most-once, exactly-once delivery]
+  lesson: message-ordering-and-delivery
+
+- slug: message-ordering
+  name: Message ordering
+  short: "Guaranteeing that messages are processed in the order sent, usually only within a key or conversation by routing it to one partition and assigning sequence numbers."
+  area: Async & Messaging
+  aliases: [sequence numbers, per-key ordering, total order]
+  lesson: message-ordering-and-delivery
+
+- slug: stream-processing
+  name: Stream processing
+  short: "Continuously computing results over unbounded event streams using windows (tumbling, sliding, session) instead of periodic batch jobs."
+  area: Async & Messaging
+  aliases: [Flink, Kafka Streams, windowing, tumbling window]
+  lesson: stream-processing-and-sketches
+
+# ---------------------------------------------------------------- Reliability
+- slug: redundancy
+  name: Redundancy
+  short: "Running more than one copy of each component so a single failure does not cause an outage. N+1 means one spare beyond the capacity you need."
+  area: Reliability
+  aliases: [N+1, N+2, replicas, high availability]
+  lesson: redundancy-and-failover
+
+- slug: failover
+  name: Failover
+  short: "Promoting a standby to take over when the primary fails, automatically or manually. Detection plus promotion typically takes seconds to a minute."
+  area: Reliability
+  aliases: [promotion, standby, hot standby]
+  lesson: redundancy-and-failover
+
+- slug: rto-rpo
+  name: RTO and RPO
+  short: "Recovery time objective is how long recovery may take; recovery point objective is how much recent data may be lost, measured in time."
+  area: Reliability
+  aliases: [RTO, RPO, disaster recovery, DR]
+  lesson: redundancy-and-failover
+
+- slug: health-checks
+  name: Health check
+  short: "A periodic probe the load balancer or orchestrator uses to decide whether an instance should receive traffic. Liveness asks 'restart me?'; readiness asks 'send me traffic?'."
+  area: Reliability
+  aliases: [liveness probe, readiness probe, heartbeat]
+  lesson: redundancy-and-failover
+
+- slug: slo-sli-sla
+  name: SLI, SLO and SLA
+  short: "An SLI is a measured indicator (for example success rate); an SLO is the internal target for it; an SLA is the contractual promise, with penalties, set looser than the SLO."
+  area: Reliability
+  aliases: [SLI, SLO, SLA, service level objective]
+  lesson: slos-and-error-budgets
+
+- slug: error-budget
+  name: Error budget
+  short: "The allowed unreliability implied by an SLO (1 minus the target). While budget remains, teams ship; when it is spent, they prioritise reliability."
+  area: Reliability
+  aliases: [burn rate, budget policy]
+  lesson: slos-and-error-budgets
+
+- slug: timeout
+  name: Timeout
+  short: "An upper bound on how long a caller waits for a dependency. Without one, a slow dependency holds threads and connections until the caller collapses too."
+  area: Reliability
+  aliases: [deadline, deadline propagation]
+  lesson: timeouts-and-retries
+
+- slug: exponential-backoff
+  name: Exponential backoff with jitter
+  short: "Retry after delays that grow exponentially and are randomized, so clients spread out instead of retrying in synchronized waves."
+  area: Reliability
+  aliases: [backoff, jitter, full jitter, retry budget]
+  lesson: timeouts-and-retries
+
+- slug: retry-storm
+  name: Retry storm
+  short: "Retries from many layers multiply load on an already struggling dependency, turning a brief slowdown into a sustained outage. Three layers of three retries is up to 27x load."
+  area: Reliability
+  aliases: [retry amplification, metastable failure]
+  lesson: timeouts-and-retries
+
+- slug: circuit-breaker
+  name: Circuit breaker
+  short: "A client-side switch that stops calling a failing dependency after an error threshold, fails fast for a cool-down period, then probes with a few requests before closing again."
+  area: Reliability
+  aliases: [open, half-open, closed, fail fast]
+  lesson: circuit-breakers-and-bulkheads
+
+- slug: bulkhead
+  name: Bulkhead
+  short: "Isolating resources such as thread pools or connection pools per dependency or tenant so one failure cannot exhaust capacity for everything else."
+  area: Reliability
+  aliases: [isolation, resource partitioning]
+  lesson: circuit-breakers-and-bulkheads
+
+- slug: graceful-degradation
+  name: Graceful degradation
+  short: "Deliberately serving a reduced experience, such as cached or partial results, when a dependency fails, instead of returning errors."
+  area: Reliability
+  aliases: [fallback, degraded mode, load shedding]
+  lesson: circuit-breakers-and-bulkheads
+
+# ---------------------------------------------------------------- Distributed Systems
+- slug: distributed-lock
+  name: Distributed lock
+  short: "A lease that grants one process exclusive access to a resource across machines. Because leases expire and processes pause, safe locks need fencing tokens."
+  area: Distributed Systems
+  aliases: [lease, Redlock, mutex, lock service]
+  lesson: distributed-locks
+
+- slug: fencing-token
+  name: Fencing token
+  short: "A monotonically increasing number issued with each lock grant; the storage layer rejects writes carrying an older token, so a paused former holder cannot corrupt data."
+  area: Distributed Systems
+  aliases: [epoch, generation number]
+  lesson: distributed-locks
+
+- slug: leader-election
+  name: Leader election
+  short: "Choosing one node to coordinate work so decisions are made in one place. Must avoid two leaders acting at once (split brain)."
+  area: Distributed Systems
+  aliases: [split brain, coordinator, ZooKeeper, etcd]
+  lesson: consensus-and-raft
+
+- slug: raft
+  name: Raft
+  short: "A consensus algorithm in which an elected leader replicates a log to followers and commits entries once a majority has them. A cluster of 2f+1 nodes tolerates f failures."
+  area: Distributed Systems
+  aliases: [consensus, Paxos, majority quorum, replicated log, term]
+  lesson: consensus-and-raft
+
+- slug: operational-transformation
+  name: Operational transformation
+  short: "A collaborative-editing technique in which a server transforms concurrent operations against each other so all clients converge. Used by Google Docs; needs a central ordering server."
+  area: Distributed Systems
+  aliases: [OT, collaborative editing]
+  lesson: consensus-and-raft
+
+- slug: crdt
+  name: CRDT
+  short: "Conflict-free replicated data type: a data structure whose concurrent updates merge deterministically in any order, enabling convergence without coordination."
+  area: Distributed Systems
+  aliases: [conflict-free replicated data type, G-counter, OR-set]
+  lesson: consensus-and-raft
+
+- slug: two-phase-commit
+  name: Two-phase commit
+  short: "A protocol where a coordinator asks all participants to prepare, then commit. It gives atomicity across systems but blocks if the coordinator fails mid-protocol."
+  area: Distributed Systems
+  aliases: [2PC, XA, distributed transaction]
+  lesson: sagas-and-outbox
+
+- slug: saga-pattern
+  name: Saga pattern
+  short: "A long-running transaction split into local steps, each with a compensating action that undoes it if a later step fails. Choreographed via events or orchestrated by a coordinator."
+  area: Distributed Systems
+  aliases: [saga, compensating transaction, orchestration, choreography]
+  lesson: sagas-and-outbox
+
+- slug: outbox-pattern
+  name: Transactional outbox
+  short: "Writing an event to an outbox table in the same database transaction as the state change, then relaying it to the message broker. It avoids the dual-write problem."
+  area: Distributed Systems
+  aliases: [outbox, dual write, change data capture, CDC]
+  lesson: sagas-and-outbox
+
+- slug: idempotency-key
+  name: Idempotency key
+  short: "A client-generated unique ID sent with a mutating request; the server stores the result under that key and returns it on retries instead of repeating the side effect."
+  area: Distributed Systems
+  aliases: [idempotent, dedup key, Idempotency-Key header]
+  lesson: idempotency-and-exactly-once
+
+- slug: exactly-once-semantics
+  name: Exactly-once processing
+  short: "The effect of each message is applied once even though delivery may repeat. Achieved through idempotent consumers or atomic offset-plus-result commits, not through the network."
+  area: Distributed Systems
+  aliases: [effectively once, dedup]
+  lesson: idempotency-and-exactly-once
+
+- slug: double-entry-ledger
+  name: Double-entry ledger
+  short: "An append-only record where every movement of money is a pair of balanced debit and credit entries, so balances are derived and auditable."
+  area: Distributed Systems
+  aliases: [ledger, append-only, reconciliation]
+  lesson: idempotency-and-exactly-once
+
+# ---------------------------------------------------------------- Operations & Security
+- slug: observability
+  name: Observability
+  short: "The ability to explain a system's internal state from its outputs: metrics for trends and alerts, logs for discrete events, traces for request paths across services."
+  area: Operations & Security
+  aliases: [metrics, logs, traces, three pillars, RED, USE]
+  lesson: observability-basics
+
+- slug: distributed-tracing
+  name: Distributed tracing
+  short: "Propagating a trace ID through every service a request touches and recording timed spans, so latency can be attributed to a specific hop."
+  area: Operations & Security
+  aliases: [tracing, spans, OpenTelemetry, trace ID]
+  lesson: observability-basics
+
+- slug: rate-limiting
+  name: Rate limiting
+  short: "Capping how many requests a client, key or IP may make per time window, rejecting the excess with 429. Protects capacity from abuse and noisy neighbours."
+  area: Operations & Security
+  aliases: [throttling, "429", quota]
+  lesson: rate-limiting
+
+- slug: authn-vs-authz
+  name: Authentication vs authorization
+  short: "Authentication establishes who the caller is; authorization decides what that identity may do. Both must be enforced on the server for every request."
+  area: Operations & Security
+  aliases: [AuthN, AuthZ, RBAC, permissions]
+  lesson: authentication-and-authorization
+
+- slug: jwt
+  name: JWT
+  short: "A signed, self-contained token carrying claims that services verify without a database lookup. Revocation is hard, so tokens are kept short-lived and paired with refresh tokens."
+  area: Operations & Security
+  aliases: [JSON web token, bearer token, access token, refresh token]
+  lesson: authentication-and-authorization
+
+- slug: oauth
+  name: OAuth 2.0 and OIDC
+  short: "OAuth delegates limited access to a third party without sharing passwords; OpenID Connect layers identity (login) on top of it."
+  area: Operations & Security
+  aliases: [OAuth2, OIDC, SSO, authorization code flow]
+  lesson: authentication-and-authorization
+
+- slug: secrets-management
+  name: Secrets management
+  short: "Storing credentials and keys in a dedicated, audited vault with rotation, and injecting them at runtime rather than committing them to code or images."
+  area: Operations & Security
+  aliases: [vault, KMS, key rotation]
+  lesson: authentication-and-authorization
+
+- slug: bot-mitigation
+  name: Bot and abuse mitigation
+  short: "Layered defences against scraping, credential stuffing and DDoS: edge filtering, per-identity rate limits, behavioural signals and challenges."
+  area: Operations & Security
+  aliases: [DDoS, WAF, scraping, credential stuffing]
+  lesson: defending-against-abuse
+
+# ---------------------------------------------------------------- Algorithms & Estimation
+- slug: back-of-the-envelope-estimation
+  name: Back-of-the-envelope estimation
+  short: "Order-of-magnitude capacity math done quickly from a few assumptions (DAU, actions per user, object size) to size QPS, storage and bandwidth before choosing an architecture."
+  area: Algorithms & Estimation
+  aliases: [capacity estimation, napkin math, Fermi estimate]
+  lesson: back-of-the-envelope
+
+- slug: peak-factor
+  name: Peak factor
+  short: "The ratio of peak to average load, typically 2-3x for daily cycles and 10x or more for events. Capacity is planned for peak, not average."
+  area: Algorithms & Estimation
+  aliases: [peak to average, burst factor, headroom]
+  lesson: estimation-playbook
+
+- slug: littles-law
+  name: Little's law
+  short: "In a stable system, the average number of requests in flight equals arrival rate times average time in system (L = lambda x W). It sizes thread pools, connections and queues."
+  area: Algorithms & Estimation
+  aliases: ["L = λW", concurrency, in-flight requests]
+  lesson: estimation-playbook
+
+- slug: token-bucket
+  name: Token bucket
+  short: "A rate-limiting algorithm where tokens refill at a steady rate up to a capacity and each request spends one. Allows bursts up to the bucket size while enforcing the average rate."
+  area: Algorithms & Estimation
+  aliases: [leaky bucket, burst capacity, refill rate]
+  lesson: rate-limiting
+
+- slug: sliding-window-counter
+  name: Sliding window counter
+  short: "A rate-limiting algorithm that weights the previous fixed window's count by its overlap with the current sliding window, approximating a true sliding log with constant memory."
+  area: Algorithms & Estimation
+  aliases: [fixed window, sliding log, sliding window]
+  lesson: rate-limiting
+
+- slug: bloom-filter
+  name: Bloom filter
+  short: "A compact probabilistic set that answers 'definitely not present' or 'possibly present' using k hash functions over a bit array. False positives, never false negatives."
+  area: Algorithms & Estimation
+  aliases: [probabilistic set, membership test]
+  lesson: stream-processing-and-sketches
+
+- slug: count-min-sketch
+  name: Count-min sketch
+  short: "A fixed-size table of counters indexed by several hashes that estimates item frequencies in a stream. It may overcount due to collisions but never undercounts."
+  area: Algorithms & Estimation
+  aliases: [CMS, frequency sketch, heavy hitters, top-k]
+  lesson: stream-processing-and-sketches
+
+- slug: hyperloglog
+  name: HyperLogLog
+  short: "A sketch that estimates the number of distinct items in a stream from the longest runs of leading zeros in hashed values, using about 12 KB for roughly 0.8% error."
+  area: Algorithms & Estimation
+  aliases: [HLL, cardinality estimation, distinct count, PFCOUNT]
+  lesson: stream-processing-and-sketches
+
+- slug: geohash
+  name: Geohash
+  short: "An encoding that interleaves latitude and longitude bits into a base-32 string, so nearby points usually share a prefix. Enables proximity search with ordinary prefix indexes."
+  area: Algorithms & Estimation
+  aliases: [geo index, S2, H3, geocell]
+  lesson: geospatial-indexing
+
+- slug: quadtree
+  name: Quadtree
+  short: "A tree that recursively splits 2D space into four quadrants until each cell holds few enough points. Adapts cell size to density, unlike fixed-precision geohash."
+  area: Algorithms & Estimation
+  aliases: [spatial index, R-tree]
+  lesson: geospatial-indexing

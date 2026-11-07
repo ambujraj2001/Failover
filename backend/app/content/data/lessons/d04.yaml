@@ -1,0 +1,176 @@
+- slug: caching-fundamentals
+  day: 4
+  title: Caching fundamentals
+  minutes: 10
+  summary: A cache keeps recent answers in fast memory so repeated questions skip the slow database, and the hit ratio decides how much it helps.
+  plain: |
+    Suppose a coworker asks you the Wi-Fi password ten times a day. The first time, you walk to
+    the router and read the sticker. After that, you write it on a sticky note on your desk. Every
+    later question takes one second instead of a walk. The sticky note is a **cache**.
+
+    In systems, a cache is a small, very fast store, usually in **RAM** (memory), that keeps copies
+    of answers you computed or fetched recently. The most common one is **Redis**. Reading from
+    Redis takes under a millisecond; asking a busy database can take 5, 50 or 500.
+
+    The usual pattern is called **cache-aside**:
+
+    1. The app asks the cache: "do you have link `abc123`?"
+    2. If yes, that is a **cache hit**. Return it. Done.
+    3. If no, that is a **cache miss**. Ask the database, return the answer, and also save it in
+       the cache for next time.
+
+    The **hit ratio** is the share of requests the cache answers. At 95%, only 1 in 20 requests
+    reaches the database. At 99%, only 1 in 100. That small-looking change from 95 to 99 cuts
+    database traffic by a factor of five.
+
+    Copies can go out of date. If someone changes the Wi-Fi password, your sticky note is wrong.
+    So cached items get a **TTL**, a **time to live**: after, say, ten minutes the copy is thrown
+    away and the next request fetches a fresh one.
+
+    Caches work because real traffic is lopsided. A small number of popular items (a viral link, the
+    home page, a celebrity's profile) get most of the requests. Keep those in memory and the
+    database relaxes.
+  deeper: |
+    ### The arithmetic
+    With hit ratio `h`, cache latency `c` and database latency `d`:
+
+    ```
+    mean latency  = h*c + (1-h)*d
+    DB read load  = (1-h) * read_qps
+    ```
+
+    At 4,000 reads/s: h = 0.90 → 400 qps to the DB; h = 0.95 → 200; h = 0.99 → 40. A medium
+    PostgreSQL in the simulator handles ~1,500 indexed qps, so even a mediocre hit ratio rescues it.
+    A Redis node handles ~80k ops/s at ~0.8 ms in the simulator, consistent with real single-node
+    Redis doing 100k+ simple ops/s.
+
+    ### Patterns
+    | Pattern | Read path | Write path | Use when |
+    |---|---|---|---|
+    | Cache-aside | app checks cache, loads from DB on miss | app writes DB, then deletes key | default; app controls everything |
+    | Read-through | cache loads from DB itself on miss | as cache-aside | a library or proxy handles loading |
+    | Write-through | as read-through | write cache and DB synchronously | reads right after writes must hit |
+    | Write-back | as read-through | write cache, flush to DB later | write-heavy, loss of recent writes acceptable |
+
+    ```python
+    def get_link(code):
+        url = redis.get(f"link:{code}")
+        if url is not None:
+            return url
+        url = db.fetch_one("SELECT url FROM links WHERE code = %s", code)
+        redis.set(f"link:{code}", url, ex=3600)
+        return url
+    ```
+
+    ### Choosing TTLs
+    TTL bounds staleness and also caps hit ratio: an item requested once a minute with a 10 s TTL
+    misses most of the time. Set TTL from how stale the data may be, then check hit ratio. Immutable
+    data (a short link's target, a content-addressed blob) can use hours or days.
+
+    ### Failure modes
+    - **Cold cache**: after a restart or flush every request misses and the database sees full
+      load instantly. The simulator warms with a ~8 s time constant; real caches can take minutes.
+    - **Cache as a hidden dependency**: if the DB cannot survive without the cache, the cache is
+      now a tier you must make highly available.
+    - **Caching errors or nulls** without a short TTL, or not caching nulls at all, letting
+      requests for non-existent keys hammer the DB (cache penetration).
+    - **Large values**: a 1 MB value at 10k rps is 10 GB/s of network.
+
+    ### When not to cache
+    Low-reuse data (every key read once), data that must be read-your-writes everywhere, or a
+    database that is not actually the bottleneck. Measure first: a missing index is cheaper to fix
+    than a cache tier is to run.
+  key_points:
+    - "Cache-aside: read the cache, on a miss load from the database and populate the cache."
+    - "Database read load is (1 - hit ratio) x reads: going from 95% to 99% hits cuts it five-fold."
+    - "TTL bounds staleness and also caps hit ratio for infrequently read keys."
+    - "Plan for a cold cache: the database must survive the moment the cache is empty."
+  concepts: [cache-aside, cache-hit-ratio, ttl, read-through-cache, write-through-cache]
+
+- slug: cache-invalidation
+  day: 4
+  title: Cache invalidation
+  minutes: 9
+  summary: When the source data changes, the cached copy must be removed or replaced, and doing that correctly under concurrency is harder than it looks.
+  plain: |
+    Back to the sticky note with the Wi-Fi password. The office manager changes the password.
+    Your note is now wrong, but you do not know it, and you keep handing out the old password.
+    Your colleagues get a **stale read**: an answer that used to be true.
+
+    **Cache invalidation** means removing or updating a cached copy when the real data changes.
+    There are three basic approaches:
+
+    - **Wait it out (TTL).** Every copy expires after a fixed time. Simple, but for that window
+      people see old data. A 10 minute TTL means a changed profile picture can take up to 10 minutes
+      to appear.
+    - **Delete on write.** Whenever the app changes something in the database, it also deletes
+      the matching key from the cache. The next read misses and fetches the fresh value.
+    - **Update on write.** The app writes the new value into the cache directly.
+
+    Most teams use delete-on-write with a TTL as a safety net. Deleting is safer than updating,
+    for a reason that has to do with timing.
+
+    Imagine two people act at almost the same moment. One is reading the old value from the
+    database to put in the cache. The other changes the value and deletes the cache key. If the
+    reader is slow and writes its old value into the cache *after* the delete, the cache now holds
+    stale data, and nothing will fix it until the TTL runs out. That is a **race condition**: the
+    result depends on which of two things happens first.
+
+    There is a famous joke that the two hard problems in computer science are naming things and
+    cache invalidation. This lesson is why.
+  deeper: |
+    ### Why delete beats update
+    With update-on-write, two concurrent writers can apply DB writes in order A, B but cache writes
+    in order B, A, leaving A's value cached indefinitely. Deletes are idempotent and commute: any
+    order of two deletes leaves the key absent.
+
+    ### The remaining race (cache-aside)
+    ```
+    t1  reader: cache miss for k
+    t2  reader: SELECT -> v1
+    t3  writer: UPDATE -> v2, COMMIT
+    t4  writer: DEL k
+    t5  reader: SET k = v1        <- stale until TTL
+    ```
+    It requires the read to straddle the whole write, so it is rare but real under load.
+    Mitigations, in increasing cost:
+    - **Short TTL** as a backstop: bounds the damage.
+    - **Delayed double delete**: delete, then delete again ~1 s later.
+    - **Versioned writes**: store `(value, version)` and use a Lua script or `SET` with a check so
+      an older version cannot overwrite a newer one.
+    - **Lease/token** (Facebook's memcache paper): the miss hands out a lease; a delete invalidates
+      it; a `SET` with an invalid lease is rejected.
+
+    ### Delete must happen after commit
+    Deleting before the transaction commits lets a reader repopulate the old value in between.
+    Deleting after commit but crashing in between leaves stale data until TTL. For strong
+    guarantees, drive invalidation from the database's change log (**change data capture**:
+    Debezium reading the PostgreSQL WAL or MySQL binlog), which retries until it succeeds.
+
+    ### Versioned keys
+    Instead of invalidating, change the key: `user:42:v17`. Bump the version on write (stored in the
+    row or a small counter). Old entries simply stop being read and age out. This is how CDNs handle
+    fingerprinted assets, and it makes "invalidate everything for user 42" a single increment.
+
+    ### Derived and aggregated data
+    The hard cases are caches of computed results (a feed page, a search result, a count) that
+    depend on many rows. Either accept TTL-bounded staleness, or maintain them incrementally from
+    events. Trying to enumerate every key affected by a write does not scale.
+
+    ### Trade-off to state out loud
+    | Data | Strategy |
+    |---|---|
+    | Immutable (short link target, blob by hash) | long TTL, never invalidate |
+    | Per-entity, user-visible edits (profile) | delete on write + TTL 5 to 15 min |
+    | Must never be stale (balance, permissions) | do not cache, or cache with versions read from the primary |
+    | Aggregates (like counts) | TTL of seconds, approximate is fine |
+
+    In the simulator, `invalidate_on_write: false` produces measurable stale reads; that is the
+    behaviour you are paying to remove.
+  key_points:
+    - "Prefer deleting the cache key on write over updating it; deletes are idempotent and order-independent."
+    - "Always keep a TTL as a backstop for races and missed invalidations."
+    - "Invalidate after the transaction commits; for strong guarantees, drive invalidation from change data capture."
+    - "Versioned keys sidestep invalidation: change the key and let old entries expire."
+    - "Decide staleness tolerance per data type; some data should not be cached at all."
+  concepts: [cache-invalidation, stale-reads, delete-on-write, versioned-cache-keys, change-data-capture]

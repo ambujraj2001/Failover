@@ -1,0 +1,144 @@
+- slug: estimation-playbook
+  day: 26
+  title: The estimation playbook
+  minutes: 10
+  summary: "A small set of reference numbers and a fixed procedure for turning users into QPS, storage and machine counts out loud in under five minutes."
+  plain: |
+    **Back-of-the-envelope estimation** is quick, rough arithmetic to find the size of a problem. You are not trying to be exact; you are trying to learn whether the answer is 10, 10,000 or 10 million, because each of those leads to a different design. One server handles 10 writes per second without noticing. Ten million writes per second needs a fleet and a careful plan.
+
+    It is like planning a party. You do not count crisps one by one; you say "about 50 guests, each eats about two handfuls, so roughly four big bags". Rounded, fast, good enough to decide what to buy.
+
+    The procedure is always the same:
+    1. **Start from users**: daily active users (**DAU**), and how many times each one does the main action per day.
+    2. **Turn per-day into per-second**: a day has 86,400 seconds; round it to 100,000 so the maths is easy. One million actions a day is about 10 per second.
+    3. **Find the peak**: traffic is uneven; assume the busiest hour is two to three times the average.
+    4. **Split reads and writes**: most systems read far more than they write, often 10 to 100 times more.
+    5. **Size the storage**: bytes per item times items per day times days kept.
+    6. **Turn into machines**: divide by what one machine can handle.
+
+    Say each step out loud and write the numbers down. Round to one significant figure. If the interviewer gives you a number, use it; if not, state your assumption ("I'll assume 100 million daily users") and move on. A wrong but stated assumption is fine. A silent calculation is not.
+  deeper: |
+    ### Numbers to memorise
+    | Quantity | Value |
+    |---|---|
+    | Seconds per day | 86,400, round to 10^5 |
+    | 1M / day | ~12 / s |
+    | 1B / day | ~12k / s |
+    | Seconds per month / year | ~2.6M / ~31.5M |
+    | 2^10 / 2^20 / 2^30 / 2^40 | ~thousand / million / billion / trillion |
+    | Peak to average | 2–3x typical; 5–10x for events, launches, sales |
+
+    ### Latency ladder (order of magnitude)
+    | Operation | Time |
+    |---|---|
+    | Main memory reference | ~100 ns |
+    | Redis GET in the same AZ | ~0.5–1 ms round trip |
+    | SSD random read | ~20–100 µs |
+    | Indexed Postgres point read | ~1–5 ms |
+    | Cross-AZ round trip | ~1–2 ms |
+    | Cross-continent round trip | ~70–150 ms |
+    | Spinning disk seek | ~10 ms |
+
+    ### Capacity rules of thumb
+    | Component | Ballpark per node |
+    |---|---|
+    | Stateless app server (simple handler) | 1k–10k rps |
+    | Redis | ~100k ops/s (the simulator uses 80k) |
+    | Postgres primary | a few thousand to ~20k simple writes/s; tens of thousands of indexed reads/s |
+    | Kafka partition | ~5–10 MB/s; a broker hundreds of MB/s |
+    | WebSocket/SSE gateway | 100k–250k connections planned |
+
+    ### Size of things
+    ID 8 B, timestamp 8 B, UUID 16 B, short text post with metadata ~300–500 B, compressed photo 200 KB–2 MB, one minute of 1080p video at 5 Mbps ~37 MB.
+
+    ### The procedure, compressed
+    ```
+    writes/s  = DAU x actions/day / 1e5          (x peak factor)
+    reads/s   = writes/s x read:write ratio
+    storage/y = writes/day x bytes x 365 x replication (3)
+    bandwidth = reads/s x bytes per response
+    machines  = peak load / (per-node capacity x 0.6 target utilisation)
+    ```
+
+    ### Habits that score well
+    - Round early and say so. 86,400 becomes 100,000; 365 becomes 400 when convenient.
+    - Carry units. Writing "MB/s" vs "Mb/s" catches 8x errors.
+    - End each number with a decision: "~6k writes/s peak fits one Postgres primary for now; reads at 600k/s need a cache."
+    - Sanity-check against known systems: if your chat app needs more storage than YouTube, recheck.
+
+    ### Common errors
+    Forgetting the peak factor, mixing bits and bytes, forgetting replication (x3), and computing storage for one day when retention is five years.
+  key_points:
+    - "Estimation exists to choose between designs; one significant figure is enough."
+    - "Procedure: DAU x actions / 100,000 seconds, times peak factor, split reads and writes, then storage and machines."
+    - "Memorise a handful of reference numbers: 1M/day is about 12/s, latency ladder, per-node capacities, sizes of common objects."
+    - "State assumptions aloud, carry units, include replication and retention, and end each number with a design decision."
+  concepts: [back-of-the-envelope, capacity-planning, qps-estimation, latency-numbers]
+
+- slug: estimation-worked-examples
+  day: 26
+  title: Estimation worked examples
+  minutes: 12
+  summary: "Four complete estimates — a Twitter-scale timeline, a URL shortener, a chat service and video streaming — showing how each number drives a design choice."
+  plain: |
+    The best way to get fast at estimation is to watch it done a few times, then do it yourself out loud. Below are four worked examples. Each follows the same steps from the playbook: users, actions per day, per second, peak, reads versus writes, storage, then what it means for the design.
+
+    Watch for the moment in each example where a number changes the design. That moment is the whole point. For a URL shortener, the writes are tiny but the reads are huge, so the answer is "cache everything popular". For a Twitter-like service, the surprise is not how many tweets are posted, but how many timeline copies are created when each tweet is delivered to every follower. For chat, it is the number of open connections. For video, it is the network bandwidth, which is far larger than anything else.
+
+    A few reminders before reading:
+    - **QPS** means queries (requests) per second.
+    - **Fan-out** means one action creating many pieces of work, such as one post being copied into thousands of followers' feeds.
+    - **Replication factor** is how many copies of the data are kept for safety, usually three.
+    - **Egress** is data sent out to users over the network.
+
+    Try each one yourself first: cover the deeper section, write your own numbers, then compare. Your numbers may differ from these by two or three times; that is fine. What matters is reaching the same conclusion about what is hard. Practise saying the whole chain aloud in under three minutes.
+  deeper: |
+    ### 1. Twitter-scale timeline
+    Assume 200M DAU, 500M tweets/day, each user loads their timeline 10 times/day, 20 tweets per load, average 200 followers.
+    ```
+    writes:     500M / 1e5             ~ 5k tweets/s avg, ~15k/s peak (3x)
+    timeline:   200M x 10 / 1e5        ~ 20k timeline reads/s avg, ~60k peak
+    tweet reads: 20k x 20               ~ 400k tweet objects/s avg
+    fan-out:    500M x 200 / 1e5       ~ 1M timeline inserts/s avg
+    text store: 500M x 300 B           = 150 GB/day ~ 55 TB/yr, x3 ~ 165 TB/yr
+    media:      10% with 500 KB image  = 25 TB/day ~ 9 PB/yr
+    timeline cache: 200M x 800 ids x 16 B ~ 2.6 TB of RAM
+    ```
+    **Decisions**: 15k writes/s is modest; the 1M/s fan-out is the real load, so push to follower caches for normal users and pull for accounts with millions of followers. 2.6 TB of timeline cache is a Redis cluster of ~50–100 nodes. Media dominates storage, so it goes to object storage behind a CDN. (Real peaks were higher: Twitter recorded ~143k tweets/s in 2013 — design for event spikes.)
+
+    ### 2. URL shortener
+    100M new URLs/day, 100:1 read:write, 500 B per row, kept 5 years.
+    ```
+    writes: 100M / 1e5 ~ 1k/s (peak ~3k)   reads: ~100k/s (peak ~300k)
+    storage: 100M x 500 B = 50 GB/day ~ 18 TB/yr ~ 90 TB over 5 yrs
+    keys: 62^7 ~ 3.5 trillion  vs  100M x 365 x 5 ~ 180B needed -> 7 chars is enough
+    hot set: 10M distinct URLs clicked/day x 500 B ~ 5 GB -> fits one cache node
+    ```
+    **Decisions**: writes fit one primary; reads must hit cache/CDN (300k/s against a DB is pointless); storage needs sharding or a KV store by year three.
+
+    ### 3. Chat
+    500M DAU, 40 messages sent/day, 100 B each, 20% concurrently online at peak.
+    ```
+    messages: 500M x 40 / 1e5 = 200k/s avg, ~600k/s peak
+    storage:  20B x 100 B = 2 TB/day ~ 730 TB/yr before replication
+    connections: 100M concurrent / 200k per gateway = 500 gateways (+ headroom)
+    heartbeats: 100M / 30 s ~ 3.3M/s tiny frames
+    ```
+    **Decisions**: the connection tier and its routing table (user to gateway) are the core problem; message storage partitioned by conversation id; heartbeats alone exceed the message rate.
+
+    ### 4. Video streaming egress
+    Assume 1B hours watched/day at an average 2.5 Mbps.
+    ```
+    bits/day = 1e9 h x 3,600 s x 2.5e6 b/s = 9e18 b ~ 1.1 EB/day
+    average  = 9e18 / 86,400 ~ 100 Tbps, peak ~ 200–300 Tbps
+    ```
+    **Decision**: no origin can serve that; the design is a CDN with ISP-embedded caches, and every 10% of cache hit ratio is tens of Tbps.
+
+    ### Saying it aloud
+    "Five hundred million tweets a day is about five thousand a second, fifteen at peak. That's fine for writes. But with two hundred followers each, fan-out is a million inserts a second, so fan-out is what I'll design around."
+  key_points:
+    - "Each estimate should end with the number that changes the design: fan-out for feeds, reads for shorteners, connections for chat, egress for video."
+    - "Twitter-scale: about 5k tweets/s average but about 1M timeline inserts/s from fan-out, and media dominating storage."
+    - "URL shortener: about 1k writes/s, 100k+ reads/s, a 5 GB hot set and 7 base62 characters covering trillions of keys."
+    - "Being within 2–3x is fine; reaching the right conclusion and saying it in under three minutes is the skill."
+  concepts: [back-of-the-envelope, qps-estimation, fan-out, storage-estimation]

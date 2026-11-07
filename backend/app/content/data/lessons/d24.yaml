@@ -1,0 +1,116 @@
+- slug: finding-the-bottleneck
+  day: 24
+  title: Finding the bottleneck
+  minutes: 11
+  summary: "A repeatable method for locating the one component that limits the whole system, and why latency explodes long before utilisation reaches 100%."
+  plain: |
+    A system is only as fast as its slowest step. That slowest step is the **bottleneck**. Making anything else faster changes nothing; it just moves the queue.
+
+    Picture a motorway with four lanes that narrows to one lane at roadworks. Widening the four-lane section to six does nothing; the jam forms at the roadworks either way. Worse, the jam does not start when the single lane is completely full. Traffic slows dramatically once that lane is about 80–90% busy, because any small burst has nowhere to go and builds a queue that takes a long time to drain.
+
+    Finding the bottleneck is a habit, not a guess:
+    1. **Follow a request** from the user to the database and back, and write down each hop.
+    2. **For each hop, compare load to capacity**: how many requests per second arrive, and how many can it handle?
+    3. **Look for queues**: growing wait times, thread pools full, connection pools exhausted, consumer lag rising.
+    4. **Fix the tightest one**, then measure again, because the bottleneck will move to the next hop.
+
+    Three terms help. **Utilisation** is how busy something is, as a percentage of its capacity. **Saturation** is work that is waiting because the thing is busy. **Little's law** says the number of requests in flight equals the arrival rate times the time each one takes. If 1,000 requests per second each take 0.2 seconds, 200 are in progress at any moment — and if your servers only have 128 threads, requests start waiting even though the CPU looks idle.
+  deeper: |
+    ### Why 80% is "full"
+    For a simple queue, response time is roughly `service_time / (1 - utilisation)`:
+
+    | Utilisation | Response time vs idle |
+    |---|---|
+    | 50% | 2x |
+    | 80% | 5x |
+    | 90% | 10x |
+    | 95% | 20x |
+
+    Real systems with bursty traffic are worse. Target 60–70% at peak for anything latency-sensitive; the simulator's autoscaler targets 60% CPU for this reason.
+
+    ### Walk the path with numbers (simulator capacities)
+    Black Friday: 10,000 dynamic rps, 90% reads, 90% cache hit ratio.
+
+    | Hop | Load | Capacity | Utilisation |
+    |---|---|---|---|
+    | Load balancer | 10k rps | 100k rps | 10% |
+    | App, 12 x large | 9,000 + 1,000 x 1.3 = 10,300 units | 12,000 | 86% — tight |
+    | Cache, 1 node | 9,000 ops | 80k ops | 11% |
+    | DB primary, large | 900 reads + 1,000 x 1.5 writes = 2,400 | 3,500 | 69% |
+
+    Now drop the index on the queried column: each read costs 15 units, 900 x 15 = 13,500 units on a 3,500-unit primary. The DB is at 450% and everything behind it times out. Flush the cache and DB read load goes from 900 to 9,000 in one tick. Same architecture, three different bottlenecks depending on the event. That is the point of the final simulation.
+
+    ### Hidden limits that are not CPU
+    - **Thread / connection pools**: Little's law. 1,000 rps x 200 ms = 200 in flight; a server with 128 threads is saturated while its CPU reads 30%, because the threads are waiting on a slow dependency.
+    - **DB connections**: Postgres degrades past a few hundred active connections; use a pooler (PgBouncer).
+    - **Single-threaded hops**: one Redis key, one Kafka partition (5k msg/s in the simulator), one shard.
+    - **Locks and hot rows**: one counter row updated by every request serialises the workload.
+    - **Downstream timeouts**: the slowest dependency sets your p99 under fan-out. If one page calls 20 services, it hits each one's p99 on about 18% of loads.
+
+    ### Method under pressure
+    Start at the symptom (p99 up, errors up), find the first hop where queueing appears (latency or saturation rises), and confirm with one change at a time. Use USE per resource and RED per service. Resist adding capacity everywhere: it hides the cause and costs money.
+
+    ### What interviewers probe
+    "Your design at 10x traffic — what breaks first?" Name the hop, show the arithmetic, and propose the next fix.
+  key_points:
+    - "The bottleneck is the hop with the highest load-to-capacity ratio; optimising anything else does nothing."
+    - "Latency grows as 1/(1 - utilisation): 5x at 80%, 10x at 90%, so plan for 60–70% at peak."
+    - "Little's law (in-flight = rate x latency) exposes thread and connection pool limits while CPU looks idle."
+    - "Fix one bottleneck, re-measure, and expect it to move; events like cache flushes create new bottlenecks instantly."
+  concepts: [bottleneck-analysis, littles-law, queueing-theory, utilization, use-method]
+
+- slug: cost-aware-design
+  day: 24
+  title: Cost-aware design
+  minutes: 9
+  summary: "How to compare designs by cost per unit of work, where cloud bills actually come from, and which cheap components buy the most capacity."
+  plain: |
+    Every design has a price, and the cheapest design that meets the requirements is usually the best one. "Add another database replica" and "add a cache" can both fix slow reads, but one might cost ten times more than the other.
+
+    Think of moving house. You could hire a removal lorry for every trip, or you could pack better and do it in one trip. Both get your things moved; the bill differs enormously. In system design, the equivalent of packing better is putting cheap, fast layers (a CDN, a cache) in front of expensive ones (databases, app servers), so the expensive layers only do work that truly needs them.
+
+    A useful way to think is **cost per unit of work**: dollars per thousand requests, or per gigabyte served. Compare components on that basis, not on price per machine. A machine that costs twice as much but handles four times the load is the cheaper choice.
+
+    Cloud bills usually come from a few places:
+    - **Compute**: servers running, whether busy or idle.
+    - **Storage**: data kept, priced per gigabyte per month.
+    - **Data transfer**, often called **egress**: bytes leaving the cloud to users or to other regions, which is surprisingly expensive.
+    - **Managed services**: databases, queues and logging, often priced per request or per gigabyte.
+
+    Two habits save the most money: turn off what is idle (autoscale down at night), and stop moving bytes you do not need to move (cache at the edge, compress, keep traffic within one region).
+  deeper: |
+    ### Cost per unit, using the simulator's price list
+    | Component | Capacity | $/hr | $/hr per 1k ops/s |
+    |---|---|---|---|
+    | App server, small | 250 rps | 0.04 | 0.16 |
+    | App server, large | 1,000 rps | 0.17 | 0.17 |
+    | Postgres, large (per node) | 3,500 qps | 0.36 | 0.10 |
+    | Postgres, xlarge | 8,000 qps | 0.72 | 0.09 |
+    | Redis 4 GB node | 80,000 ops | 0.06 | 0.00075 |
+
+    A cache operation is about 100x cheaper than a database query. Absorbing 9,000 reads/s with one cache node costs $0.06/hr; serving them with three large read replicas costs $1.08/hr and adds replication lag. This is why "cache first, replicas second, shard last" is the usual order, and why many labs set a budget that rules out simply buying the biggest database.
+
+    ### Real-world reference points (order of magnitude, US regions)
+    - Object storage: ~$0.023/GB-month standard, ~$0.004 or less for archive tiers.
+    - Internet egress: ~$0.05–0.09/GB from the cloud; CDN egress often cheaper at volume.
+    - Cross-AZ traffic: ~$0.01/GB each way; cross-region ~$0.02/GB. Chatty microservices across AZs add up.
+    - Reserved or committed instances: 30–60% off on-demand; spot or preemptible: 60–90% off, can be reclaimed with about 2 minutes' notice (on AWS).
+
+    ### Levers in order of payoff
+    1. **Do less work**: cache, CDN, batch, compress. Often 10x.
+    2. **Right-size**: most fleets run at 10–20% average CPU; autoscaling and smaller instances recover much of that.
+    3. **Buy smarter**: commit for the baseline, spot for batch and stateless burst.
+    4. **Tier data**: hot in SSD/memory, warm in object storage, cold in archive with lifecycle rules.
+    5. **Watch the long tail of telemetry**: logging and metrics are frequently the third-largest line item.
+
+    ### When cheap is wrong
+    Cutting redundancy to save money trades cost for availability; say so explicitly. A single-AZ database saves roughly half and turns an AZ outage into a full outage. Spot instances for a stateful primary is a bug, not an optimisation.
+
+    ### What interviewers probe
+    Senior candidates are expected to mention cost unprompted: "The CDN cuts origin egress by 90%, which is most of the bill." Give one number, one lever, and the reliability trade-off.
+  key_points:
+    - "Compare components by cost per unit of work, not price per machine."
+    - "Cheap layers in front (CDN, cache) are orders of magnitude cheaper per request than databases or app servers."
+    - "Bills come from compute, storage, egress and managed services; egress and logging surprise people most."
+    - "Biggest levers are doing less work, right-sizing and committed or spot pricing; never cut redundancy silently."
+  concepts: [cost-optimization, unit-economics, egress-cost, autoscaling]

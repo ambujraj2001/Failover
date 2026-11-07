@@ -1,0 +1,178 @@
+- slug: api-design-essentials
+  day: 12
+  title: API design essentials
+  minutes: 10
+  summary: A good API names resources clearly, uses HTTP methods and status codes as intended, pages through large lists with cursors, and makes retries safe with idempotency.
+  plain: |
+    An **API** (application programming interface) is the menu your system offers to other
+    programs: the list of things they can ask for and what they get back. Like a restaurant menu, a
+    good one is predictable. You should be able to guess what an item is from its name.
+
+    Most web APIs follow a style called **REST**. The idea: everything is a **resource** with an
+    address (a URL), and you act on it with a small set of **HTTP methods** (verbs):
+
+    - `GET /orders/42`: read order 42. Never changes anything.
+    - `POST /orders`: create a new order.
+    - `PUT` or `PATCH /orders/42`: replace or modify order 42.
+    - `DELETE /orders/42`: remove it.
+
+    The response carries a **status code**: `200` means OK, `201` created, `400` your request was
+    wrong, `404` not found, `429` slow down, `500` the server broke.
+
+    Two ideas make APIs hold up in real life.
+
+    **Pagination.** If someone asks for "all orders" and there are ten million, you cannot send them
+    all at once. You send a **page**, say 50 at a time, plus a way to ask for the next page.
+
+    **Idempotency.** Networks are unreliable. A phone sends "pay £20", the connection drops, and
+    the app is not sure whether the request arrived. It tries again. Without care, the customer pays
+    twice. An operation is **idempotent** if doing it twice has the same effect as doing it once. The
+    usual trick: the client attaches a unique ID to the request, an **idempotency key**. The server
+    remembers keys it has already processed, and if the same key arrives again, it returns the
+    original result instead of charging again.
+  deeper: |
+    ### Method semantics
+    | Method | Safe | Idempotent | Typical success |
+    |---|---|---|---|
+    | GET | yes | yes | 200 |
+    | PUT | no | yes | 200 / 204 |
+    | DELETE | no | yes | 204 (and 404 or 204 on repeat) |
+    | PATCH | no | not necessarily | 200 |
+    | POST | no | no, unless you make it so | 201 + `Location` |
+
+    Use status codes precisely: `409` for conflicts, `422` for validation failures, `429` with
+    `Retry-After` for throttling, `503` for overload. Clients and proxies make retry decisions from
+    them; returning `200 {"error": ...}` breaks every generic retry and monitoring tool.
+
+    ### Pagination: offset vs cursor
+    ```sql
+    -- offset: page 5,000 scans and discards 250,000 rows
+    SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50 OFFSET 250000;
+
+    -- cursor (keyset): constant cost with an index on (user_id, created_at, id)
+    SELECT * FROM orders WHERE user_id = $1
+      AND (created_at, id) < ($2, $3)
+    ORDER BY created_at DESC, id DESC LIMIT 50;
+    ```
+    Return an opaque `next_cursor` (base64 of the last `(created_at, id)`). Cursor pagination is
+    stable when rows are inserted mid-scroll (offset pages skip or repeat items) and its cost does
+    not grow with depth. Offset still suits small admin tables that need "jump to page 7".
+
+    ### Idempotency keys
+    ```
+    POST /payments
+    Idempotency-Key: 7f9c2b1e-...
+    ```
+    Server side: in one transaction, insert `(key, request_hash, status='in_progress')` with a unique
+    constraint; on conflict, return the stored response (or `409` if still in progress, or `422` if the
+    body differs). Store the final response with the key; keep keys 24 h or more. Stripe's API is the
+    reference design.
+
+    ### Versioning and evolution
+    Additive changes (new optional fields, new endpoints) need no version. Breaking changes go in
+    `/v2/` or a header. Clients must ignore unknown fields. Never reuse a field name with a new
+    meaning.
+
+    ### Other things reviewers look for
+    - Batch endpoints to avoid N round trips; field selection for mobile clients.
+    - Consistent error body: `{code, message, details, request_id}`.
+    - Rate-limit headers and authentication on every endpoint.
+    - Long operations return `202 Accepted` and a status resource to poll.
+
+    In interviews, define the 3 to 6 core endpoints with key parameters and response shape, choose
+    cursor pagination for feeds and lists, and add idempotency to any endpoint that creates money,
+    orders or messages.
+  key_points:
+    - "Model resources as nouns and use HTTP methods and status codes for their defined meanings."
+    - "GET, PUT and DELETE are idempotent by definition; POST needs an idempotency key to be safe to retry."
+    - "Cursor (keyset) pagination has constant cost and stays stable under inserts; offset pagination degrades with depth."
+    - "Evolve APIs additively; put breaking changes behind a new version."
+  concepts: [rest-api-design, http-status-codes, cursor-pagination, idempotency-key, api-versioning]
+
+- slug: rate-limiting
+  day: 12
+  title: Rate limiting
+  minutes: 10
+  summary: Rate limiting caps how many requests each client may make per unit of time, protecting capacity from scrapers, bugs and abuse while legitimate users carry on.
+  plain: |
+    A popular nightclub lets people in at a steady pace, and if one person keeps trying to bring in
+    fifty friends at once, the bouncer says "not all of you, not right now". Nobody inside gets
+    crushed, and the regulars still get in.
+
+    **Rate limiting** is that bouncer for your API. It counts how many requests each **client** (a
+    user, an API key or an IP address) sends, and if they go over an allowed rate, such as 100
+    requests per minute, the extra requests are rejected with status code **429 Too Many Requests**,
+    usually with a `Retry-After` header saying when to try again.
+
+    Why bother? Your servers have a fixed capacity. Without limits, one **scraper** (a bot copying
+    your data), one buggy client stuck in a loop, or one attacker can use all of it, and everyone
+    else gets slow pages or errors.
+
+    The most common way to count is the **token bucket**. Picture a bucket that holds up to 20
+    tokens. It refills at 5 tokens per second. Each request takes one token. If the bucket is empty,
+    the request is rejected. This allows short **bursts** (a page that loads 20 things at once is
+    fine) while capping the long-run average at 5 per second.
+
+    Where do you put the bouncer? As far forward as possible, at the **load balancer** or an
+    **API gateway** in front of your servers, so rejected requests cost almost nothing.
+
+    Setting the limit is a balancing act. Too strict, and real users get blocked. Too loose, and the
+    bots get through. Good limits are based on what normal users actually do, with room to spare.
+  deeper: |
+    ### Algorithms
+    | Algorithm | State per key | Bursts | Accuracy |
+    |---|---|---|---|
+    | Fixed window counter | 1 counter | up to 2x at window edges | coarse |
+    | Sliding window log | every timestamp | exact | memory-heavy |
+    | Sliding window counter | 2 counters | smoothed | ~exact, cheap |
+    | Token bucket | tokens + last refill time | allows up to bucket size | exact average |
+    | Leaky bucket (queue) | queue | smooths output to a fixed rate | adds latency |
+
+    Sliding window counter estimate:
+    ```
+    count = current_window + previous_window * (1 - elapsed_fraction_of_current)
+    ```
+
+    Token bucket in Redis, atomically via a Lua script:
+    ```lua
+    -- KEYS[1]=bucket  ARGV: rate (tokens/s), capacity, now_ms
+    local rate, capacity, now_ms = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+    local b = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+    local tokens = tonumber(b[1]) or capacity
+    tokens = math.min(capacity, tokens + (now_ms - (tonumber(b[2]) or now_ms)) * rate / 1000)
+    if tokens < 1 then return 0 end
+    redis.call('HSET', KEYS[1], 'tokens', tokens - 1, 'ts', now_ms)
+    redis.call('PEXPIRE', KEYS[1], 60000)
+    return 1
+    ```
+
+    ### Distributed limits
+    A central Redis adds ~0.5 to 1 ms per request and becomes a dependency: decide whether to fail
+    open (allow traffic when Redis is down) or closed. Alternatives: local per-instance buckets with
+    limit/N each (inaccurate when load is uneven), or local buckets that sync to a central store
+    asynchronously.
+
+    ### Choosing keys and limits
+    - Key by API key or user ID when authenticated; IP only as a fallback (NAT and carrier-grade NAT
+      put thousands of users behind one IP, while botnets rotate IPs).
+    - Tier limits per endpoint: login and search cost more than a cached GET.
+    - Base limits on observed p99 per-client usage times a margin.
+
+    The trade-off shows up clearly in the simulator: the load balancer's limit at 10 rps blocks 99% of
+    bots but also 3% of legitimate traffic; at 50 rps, 97% of bots and 0.2% of legitimate users; at
+    200 rps, only 80% of bots and no legitimate users.
+
+    ### Beyond per-client limits
+    Global concurrency limits and load shedding protect the service when many well-behaved clients
+    arrive together (no individual exceeds a limit). Rate limiting is per-client fairness; load
+    shedding is self-preservation. You need both.
+
+    Interviewers expect an algorithm choice with its burst behaviour, placement at the edge, a key
+    choice, a stance on failing open or closed, and correct 429 semantics.
+  key_points:
+    - "Rate limiting caps requests per client per time window and rejects the excess with 429 and Retry-After."
+    - "Token bucket allows bounded bursts while enforcing an average rate; sliding window counters are cheap and accurate."
+    - "Enforce at the edge (load balancer or gateway) so rejected requests are nearly free."
+    - "Key by API key or user where possible; IP-based limits hit NATed users and miss rotating botnets."
+    - "Tighter limits block more bots and more real users; choose limits from observed per-client usage."
+  concepts: [rate-limiting, token-bucket, sliding-window-rate-limiting, http-429]

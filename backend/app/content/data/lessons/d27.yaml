@@ -1,0 +1,114 @@
+- slug: communicating-trade-offs
+  day: 27
+  title: Communicating trade-offs
+  minutes: 9
+  summary: "How to present design choices as decisions with costs, so the interviewer hears judgement instead of a list of technologies."
+  plain: |
+    A **trade-off** is a choice where getting more of one good thing means getting less of another. A cache makes reads faster but means some users might see slightly old data. A second database copy makes the system survive failures but costs money and adds a delay for copying.
+
+    In an interview, every component you add is a trade-off, whether you say so or not. The difference between an average and a strong answer is often just this: the strong candidate says what they are giving up and why it is worth it.
+
+    Think of buying a car. "I'll take the hatchback" tells the salesperson nothing. "I'll take the hatchback because I park in the city every day and rarely carry more than two people; I'm giving up boot space, which I can live with" tells them you understand your needs and the options. The second sentence is what interviewers want to hear about every major decision.
+
+    A simple pattern works for almost any decision:
+    1. **Name the options** (two is usually enough).
+    2. **Say what matters here** — the requirement that decides it, such as low latency or strong consistency.
+    3. **Choose**, and say what you lose.
+    4. **Say when you would change your mind** ("if writes grow past one machine, I'd shard by user").
+
+    Keep it short. One or two sentences per decision is enough for most choices; save the long discussion for the one or two decisions that really matter in this problem. Draw attention to them on purpose: "This is the key decision in this design."
+  deeper: |
+    ### The decision sentence
+    > "For the feed I'll use fan-out on write, because reads outnumber writes about 100 to 1 and we need p99 under 200 ms. The cost is write amplification — about 1M cache inserts/s — and it breaks for accounts with millions of followers, so those use fan-out on read and we merge at read time. If storage for timelines got too expensive, I'd cap cached timelines at 800 entries."
+
+    Options, deciding requirement, choice, cost, mitigation, trigger to revisit. Six elements, under 20 seconds.
+
+    ### Trade-off axes interviewers listen for
+    | Axis | Typical tension |
+    |---|---|
+    | Consistency vs latency/availability | sync replication vs async; read-your-writes vs stale reads |
+    | Read cost vs write cost | denormalise and fan out vs compute at read time |
+    | Simplicity vs scale | one Postgres vs sharded NoSQL |
+    | Cost vs reliability | multi-region vs multi-AZ; replicas vs backups |
+    | Freshness vs load | TTL length; batch vs streaming |
+    | Accuracy vs resources | exact counts vs sketches |
+    | Build vs buy | managed service vs self-hosted |
+
+    ### Make it quantitative when you can
+    "Async replication gives ~1% stale reads under normal load (more when the primary is busy); sync adds ~3 ms to each write." Those are the simulator's numbers and the kind of specificity that signals experience. A number does not have to be exact; it has to be the right order of magnitude and attached to a decision.
+
+    ### Anti-patterns
+    - **The menu**: "We could use Cassandra, or DynamoDB, or Mongo..." with no choice. Always pick.
+    - **Absolutes**: "NoSQL scales, SQL doesn't." Interviewers will push back, and they will be right.
+    - **Trade-off theatre**: listing pros and cons for a decision that does not matter (which load balancer algorithm). Spend words where the risk is.
+    - **Hiding the cost**: if your design allows stale reads or a double-delivery, say it before the interviewer finds it. Finding it yourself is a positive signal.
+
+    ### Using the whiteboard
+    Keep a short "decisions and trade-offs" list in the corner of the board as you go. During wrap-up, point at it. It doubles as a summary and proves the decisions were deliberate.
+
+    ### For E6
+    Add the organisational and operational axes: "A second datastore means a second on-call skill set; I'd only add it if Postgres can't meet the write rate." Staff-level answers weigh the cost of running the system, not just building it.
+  key_points:
+    - "Every component is a trade-off; strong candidates say what they give up and why it is acceptable here."
+    - "Use the decision sentence: options, deciding requirement, choice, cost, mitigation, when you would revisit."
+    - "Attach order-of-magnitude numbers to trade-offs, and spend words only on the decisions that carry risk."
+    - "Never present a menu without choosing, avoid absolutes, and surface your design's weaknesses before the interviewer does."
+  concepts: [trade-offs, cap-theorem, decision-making, interview-communication]
+
+- slug: handling-follow-ups
+  day: 27
+  title: Driving the conversation and handling follow-ups
+  minutes: 9
+  summary: "How to lead the session, read the interviewer's hints, and answer challenges and 'what if' questions without losing the thread."
+  plain: |
+    In a good system design interview you are the one driving, and the interviewer is a passenger who sometimes points at a turning. **Driving** means you propose the next step, keep track of time, and ask for agreement before moving on. **Follow-ups** are the interviewer's questions and challenges: "What if this server dies?", "How would this work with 100 times more users?", "Why not use a queue here?"
+
+    Follow-ups are not attacks. They are usually one of three things:
+    - **A hint**: you missed something important, and they are steering you to it.
+    - **A probe**: they want to see how deep your knowledge goes on this part.
+    - **A stress test**: they change the requirements to see if you can adapt.
+
+    Imagine a tour guide leading a group. The guide plans the route, but when someone asks "what's that building?", a good guide answers briefly and well, then returns to the route — unless the whole group wants to go inside, in which case the guide changes plan on purpose. A poor guide either ignores the question or forgets where they were going.
+
+    A reliable way to answer any follow-up:
+    1. **Pause and restate** the question in your own words, so you answer the right thing.
+    2. **Think out loud** — say the options you are considering.
+    3. **Answer and decide**, including what changes in your design.
+    4. **Return to the plan**: "That changes the storage layer; shall I continue with the delivery path?"
+
+    If you do not know something, say so and reason from first principles. "I haven't used that, but here's how I'd expect it to work" is far better than bluffing.
+  deeper: |
+    ### Phrases that drive
+    - Opening: "I'll clarify requirements, estimate, sketch the design, then go deep on X. Does that work?"
+    - Phase change: "That covers the write path end to end. Next I'd like to go deep on fan-out — or is there an area you'd rather see?"
+    - Parking: "Good point on search; I'll note it and come back after the core flow." (Then actually come back.)
+    - Checking in: "Is this the level of detail you want, or should I go deeper on the schema?"
+
+    ### Classifying the follow-up
+    | Interviewer says | Usually means | Respond by |
+    |---|---|---|
+    | "Are you sure about that?" | there is a flaw | re-examine out loud, do not just defend |
+    | "What happens if X fails?" | probe on resilience | walk the failure: detection, impact, recovery, data loss |
+    | "Now it's 100x traffic" | stress test | find the first bottleneck with numbers, fix it, find the next |
+    | "Why not just use Y?" | testing judgement, or Y is better | compare honestly; switching is fine if Y wins |
+    | Silence while you talk | they are writing notes | keep going, check in at the next phase change |
+
+    ### Failure walk template
+    "If the cache cluster dies: detection in seconds via health checks; impact is all reads hitting the DB at ~100k qps, far over its ~10k capacity; mitigation is request coalescing, a circuit breaker that serves stale or degraded responses, and warming before re-enabling. No data loss, since the cache is not the source of truth."
+
+    ### Changing your mind well
+    Changing a decision after a good challenge is a strong signal if you explain why: "You're right — with a 10-second freshness requirement, the batch job doesn't work. I'll move counting to a stream processor." Clinging to a broken design is a strong negative signal at every level.
+
+    ### When you are stuck
+    - Go back to requirements: which one does this part serve?
+    - Reduce the problem: solve it for one server, then ask what breaks at ten.
+    - Ask a narrowing question: "Is ordering required globally or per conversation?" Interviewers answer these readily.
+
+    ### Pitfalls
+    Answering a question with a monologue that eats five minutes; answering a different, easier question; treating every follow-up as a reason to redraw everything. Keep answers to 30–90 seconds unless they ask for more.
+  key_points:
+    - "Drive the session: state the plan, propose each next step, and check in at phase changes."
+    - "Follow-ups are hints, probes or stress tests; classify them, then restate, reason aloud, decide and return to the plan."
+    - "Walk failures as detection, impact, mitigation and data loss; walk scale as first bottleneck with numbers, then the next."
+    - "Changing your mind with a reason is a positive signal; bluffing and defending a broken design are negative ones."
+  concepts: [interview-communication, failure-analysis, trade-offs, deep-dive]

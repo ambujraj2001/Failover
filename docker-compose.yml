@@ -1,0 +1,44 @@
+name: failover
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: failover
+      POSTGRES_PASSWORD: failover
+      POSTGRES_DB: failover
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U failover -d failover"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Full stack (optional): `docker compose --profile full up --build`
+  api:
+    profiles: ["full"]
+    build: ./backend
+    env_file: ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://failover:failover@db:5432/failover
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  web:
+    profiles: ["full"]
+    build: ./frontend
+    depends_on:
+      - api
+    ports:
+      - "8080:80"
+
+volumes:
+  pgdata:

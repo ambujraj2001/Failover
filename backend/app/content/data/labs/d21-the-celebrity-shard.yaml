@@ -1,0 +1,179 @@
+slug: the-celebrity-shard
+kind: lab
+title: The celebrity shard
+difficulty: hard
+day: 21
+summary: One pop star's post sends half of all traffic to a single shard. Adding shards barely helps; change how the hot key is placed.
+topics: [sharding, shard-keys, hot-partitions, hot-keys, partitioning]
+company_tags: [Twitter, Instagram, Discord]
+estimated_minutes: 30
+incident: "SEV-2 · p99 1.0 s on /posts/:id · posts-db shard 3 at 107% · shards 0, 1, 2 under 30%"
+
+brief_beginner: |
+  You run **Murmur**, a social app. Posts, likes and comments live in PostgreSQL, split across
+  **4 shards** (four separate databases). Each row goes to a shard chosen by hashing the author's
+  user id, so on a normal day every shard gets roughly a quarter of the traffic.
+
+  Tonight a pop star with 90 million followers posted. **Half of all requests**, 2,500 per
+  second, are now about that one post: people opening it, liking it, commenting on it. Because
+  everything about her lives on the shard her user id hashes to, that one shard gets half the
+  traffic plus its normal quarter of everyone else. It is melting. The other three are bored.
+
+  This is a **hot key** (one key that gets far more traffic than the rest) causing a **hot
+  shard**. Adding more shards spreads *everyone else* thinner, but the celebrity is still one key,
+  so she still lands on one shard.
+
+  **Your job:** spread the celebrity's traffic so no single shard carries it, without paying for
+  a pile of extra databases.
+
+brief_expert: |
+  5,000 rps, 60/40 read/write, Zipf-heavy: `hot_key_share = 0.5` (one author's post). posts-db is
+  4 × PostgreSQL large (~3,500 units/s each) sharded by `hash(user_id)`. Hottest-shard share =
+  hot + (1 − hot)/N = 62.5%, i.e. ~3,750 units/s on one node (writes cost 1.5) while the others
+  idle at ~25%.
+
+  N → 8 gives 56%, N → 16 gives 53%: diminishing returns at 2–4× the cost. Replicas help reads
+  only, and 40% of this traffic is likes and comments. A cache absorbs reads of the post but not
+  the writes. Fix the key distribution: split hot keys across shards (key salting /
+  hot-key-aware placement) so the hottest shard sees ≈ 1/N. Consider a cache only as a complement.
+
+glossary:
+  - term: Shard
+    meaning: One of several independent databases that each hold part of the data, so no single machine has to hold or serve all of it.
+  - term: Shard key
+    meaning: The value used to decide which shard a row lives on, here the user id. A bad choice sends most traffic to one place.
+  - term: Hot key
+    meaning: A single key (one user, one post) that receives a large share of all traffic.
+  - term: Key salting
+    meaning: Splitting one hot key into several sub-keys (post:42#0 … post:42#7) spread over different shards, and combining them on read.
+  - term: Consistent hashing
+    meaning: A way to map keys to shards so adding a shard moves only a small share of keys. It balances many keys; it cannot split one.
+
+requirements:
+  - p99 latency under 75 ms while the celebrity post is hot
+  - Error rate under 0.5%
+  - Stay within $3.60/hr (doubling or quadrupling the shard count does not fit)
+
+budget: 3.6
+palette: [load_balancer, app_server, database, cache]
+
+starter:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Murmur API, config: {size: large, instances: 10}, position: {x: 480, y: 160}}
+    - {id: db, type: database, label: posts-db, config: {size: large, shards: 4, shard_key: hash_user}, position: {x: 720, y: 160}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Murmur API, config: {size: large, instances: 10}, position: {x: 480, y: 160}}
+    - {id: db, type: database, label: posts-db, config: {size: large, shards: 4, shard_key: hash_split_hot}, position: {x: 720, y: 160}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: db}
+
+tests:
+  - id: celebrity-post
+    name: The celebrity posts
+    summary: 5,000 req/s; half of it on one post (40% writes)
+    scenario:
+      duration: 60
+      base_rps: 5000
+      read_ratio: 0.6
+      cacheable: 0.7
+      hot_key_share: 0.5
+      working_set_gb: 4
+    assertions:
+      - {metric: p99_ms, op: lte, value: 75}
+      - {metric: error_rate, op: lte, value: 0.5}
+  - id: post-goes-viral
+    name: The post goes viral
+    summary: Traffic climbs 40% for 20 s while the post is hot
+    hidden: true
+    scenario:
+      duration: 60
+      base_rps: 5000
+      read_ratio: 0.6
+      cacheable: 0.7
+      hot_key_share: 0.5
+      working_set_gb: 4
+      spikes: [{at: 20, duration: 20, multiplier: 1.4, ramp: 4}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 125}
+      - {metric: error_rate, op: lte, value: 0.5}
+  - id: hotter-key
+    name: A bigger star replies
+    summary: 70% of traffic on one key
+    hidden: true
+    scenario:
+      duration: 60
+      base_rps: 5000
+      read_ratio: 0.6
+      cacheable: 0.7
+      hot_key_share: 0.7
+      working_set_gb: 4
+    assertions:
+      - {metric: p99_ms, op: lte, value: 75}
+      - {metric: error_rate, op: lte, value: 0.5}
+
+hints:
+  - Run the test and compare the shards. Is the database as a whole out of capacity, or is one shard doing far more than its share?
+  - Work out the hottest shard's share with 4, 8 and 16 shards when one key gets 50% of the traffic. Does adding shards ever get it close to 1/N? What would have to change instead?
+  - Change the shard key to the option that splits hot keys across shards and keep 4 shards. A cache in front of the reads is a fine extra, but remember that 40% of this traffic is likes and comments, and a cache cannot absorb writes.
+
+editorial: |
+  ### Why it broke
+  With `hash(user_id)`, everything about one author lives on one shard. The hottest shard
+  receives the celebrity's 50% plus a quarter of everyone else:
+  **0.5 + 0.5 / 4 = 62.5%** of ~6,000 units/s (3,000 reads + 2,000 writes × 1.5) ≈ **3,750
+  units/s** on a node that does ~3,500. It sits at **107%**, queries queue, API threads pile up
+  behind it: **p99 ~1 s and 6% errors**, while three shards are at ~25%.
+
+  ### Why more shards barely help
+  | shards | hottest share | hottest shard busy | p99 | cost |
+  |---|---|---|---|---|
+  | 4 | 62.5% | 107% | 1,030 ms | $3.33/hr |
+  | 8 | 56% | 96% | 428 ms | $4.89/hr |
+  | 16 | 53% | 91% | 179 ms | $8.00/hr |
+
+  The `(1 − hot)/N` term shrinks; the `hot` term does not. You can never shard a single key
+  below one shard.
+
+  ### The fix: split the hot key
+  Hot-key-aware placement appends a small salt to keys detected as hot
+  (`post:9001#0 … post:9001#3`) so their rows and counters spread over every shard. Writes go
+  to a random sub-key (likes become per-shard counters), reads fan out to the N sub-keys and sum.
+  The hottest shard now sees **1/4** of the load: ~1,500 units/s, **43% busy**, p99 **59 ms**,
+  on the same four shards at the same price.
+
+  The cost is complexity: the system has to detect hot keys (counters, sampling), reads of a hot
+  key become scatter-gather, and "how many likes" becomes an aggregation that is usually cached.
+
+  ### The trap: fixing only the reads
+  A Redis cache in front of the post looks attractive, and on the visible test it even passes
+  (hit ratio ~87%, hottest shard at 75%, p99 70 ms). But the cache only removes reads. The
+  celebrity's likes and comments still hash to one shard, so when a bigger star takes 70% of the
+  traffic, that shard climbs back near 90% and p99 goes to ~200 ms. When the post goes viral (+40%
+  traffic) the shard saturates again. Both hidden tests probe exactly this. Read replicas fail the
+  same way (and add async staleness on top).
+
+  ### Alternatives and why not
+  - **More shards**: diminishing returns, as the table shows, and 2–4× the database bill.
+  - **xlarge shards**: absorbs it (~47% busy) for ~$4.76/hr; it treats the symptom and the next,
+    bigger celebrity breaks it again.
+  - **Range sharding by time**: every new like and comment goes to the newest shard: a hot shard
+    by construction (p99 ~2 s in the simulator).
+  - **Dedicated shard for celebrities**: workable (many social networks do a version of it), but
+    one shard per hot key still caps out; salting scales with N.
+
+  ### Interview takeaway
+  A shard key balances *keys*, not *traffic*. Expect power-law skew (celebrities, viral posts,
+  big tenants), detect hot keys, and split them (salting, fan-out on read, per-shard counters),
+  with caching for hot reads as a complement rather than the fix.

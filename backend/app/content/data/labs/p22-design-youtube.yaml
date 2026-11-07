@@ -1,0 +1,247 @@
+slug: design-youtube
+kind: problem
+title: Design YouTube
+difficulty: hard
+day: 22
+summary: A video platform where 90% of requests are video segments. Serve bytes from a CDN backed by object storage, push uploads through a queue to processing workers, and cache the metadata.
+topics: [cdn, object-storage, transcoding, adaptive-bitrate, upload-pipeline, message-queue, caching, media]
+company_tags: [YouTube, Netflix, TikTok, Vimeo, Twitch]
+estimated_minutes: 50
+incident: "Architecture review · 2B monthly users · 500 hours uploaded per minute"
+
+brief_beginner: |
+  You are building a video site. People do two very different things on it:
+
+  - **Watch.** A video is not one big file. The player downloads it in small pieces of a few
+    seconds each, called **segments**. Nine out of every ten requests your system receives are
+    "give me the next segment".
+  - **Upload.** A creator sends a large raw file. Before anyone can watch it, the system has to
+    **transcode** it: convert it into several sizes and qualities (240p up to 4K), so a phone on a
+    train and a TV on fibre both get something that plays smoothly. Transcoding is slow, heavy work.
+
+  Around that sits the small stuff: titles, thumbnails, view counts, likes. That is **metadata**,
+  read constantly and changed rarely.
+
+  Today every request, including every video segment, goes through your API servers, which fetch
+  the bytes from storage and pass them on. The servers are drowning in video bytes and barely get
+  to the real work.
+
+  **Your job:** get video bytes off your servers entirely, make uploads and processing happen in
+  the background without slowing anyone down, and keep metadata fast. Then explain how upload,
+  transcoding and adaptive streaming work end to end.
+
+brief_expert: |
+  **Functional:** upload a video (resumable), process it into multiple renditions, stream with
+  adaptive bitrate, show video metadata (title, channel, counts), record views and likes.
+
+  **Non-functional:** 2B MAU, ~1B hours watched per day (~125 Tbps average egress, ~3x at peak),
+  500 hours of video uploaded per minute. Playback start under 2 s, rebuffering under 1% of watch
+  time. A new upload should be watchable within minutes. Reads dwarf writes; video bytes dwarf
+  everything. Durability for originals: 11 nines.
+
+  **Graded part:** one region at 40,000 req/s, 90% video segment requests (static). Of the dynamic
+  rest, 70% are metadata reads (90% cacheable, 8 GB hot set) and 30% are writes (upload
+  completions that start processing jobs, likes, watch-progress events). Keep the API tier as
+  sized; the budget rules out a bigger database in place of a cache and a queue.
+
+glossary:
+  - term: CDN
+    meaning: A network of servers close to viewers that keep copies of popular files, so most video bytes never travel back to your data centre.
+  - term: Object storage
+    meaning: S3-style storage for large files. Cheap, durable and practically unlimited, but each request is slow (~25 ms), so it sits behind the CDN.
+  - term: Transcoding
+    meaning: Converting an uploaded video into several resolutions, bitrates and formats so every device can play it.
+  - term: Adaptive bitrate (ABR)
+    meaning: The player measures your connection and picks the quality of each next segment, stepping down instead of freezing when the network slows.
+  - term: Segment
+    meaning: A short chunk (2–6 s) of one rendition of a video. Players download segments one after another, listed in a manifest file (HLS or DASH).
+
+requirements:
+  - "Normal day: p99 under 52 ms, error rate under 0.5% at 40,000 req/s"
+  - Survive a premiere, an upload surge and a cold metadata cache (hidden tests)
+  - Stay within $3.90/hr including CDN usage (the API tier stays at 9 large instances)
+
+budget: 3.9
+palette: [cdn, load_balancer, app_server, database, cache, queue, worker, object_storage]
+
+starter:
+  nodes:
+    - {id: users, type: users, label: Viewers & creators, position: {x: 0, y: 160}}
+    - {id: lb, type: load_balancer, position: {x: 240, y: 160}}
+    - {id: api, type: app_server, label: Video API, config: {size: large, instances: 9}, position: {x: 480, y: 160}}
+    - {id: s3, type: object_storage, label: Video storage, position: {x: 720, y: 40}}
+    - {id: db, type: database, label: Metadata DB, config: {size: large, indexes: "id, video_id"}, position: {x: 720, y: 280}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: s3}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, label: Viewers & creators, position: {x: 0, y: 160}}
+    - {id: cdn, type: cdn, label: Video CDN, position: {x: 240, y: 160}}
+    - {id: s3, type: object_storage, label: Video storage, position: {x: 480, y: 0}}
+    - {id: lb, type: load_balancer, position: {x: 480, y: 200}}
+    - {id: api, type: app_server, label: Video API, config: {size: large, instances: 9}, position: {x: 720, y: 200}}
+    - {id: redis, type: cache, label: Metadata cache, config: {memory_gb: "16", ttl_s: 300, stampede_protection: true}, position: {x: 960, y: 60}}
+    - {id: queue, type: queue, label: Processing jobs, config: {partitions: 4}, position: {x: 960, y: 320}}
+    - {id: workers, type: worker, label: Processing workers, config: {size: medium, instances: 4}, position: {x: 1200, y: 320}}
+    - {id: db, type: database, label: Metadata DB, config: {size: large, indexes: "id, video_id"}, position: {x: 1200, y: 160}}
+  edges:
+    - {source: users, target: cdn}
+    - {source: cdn, target: s3}
+    - {source: cdn, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: redis}
+    - {source: api, target: db}
+    - {source: api, target: queue}
+    - {source: queue, target: workers}
+    - {source: workers, target: db}
+
+tests:
+  - id: normal
+    name: An ordinary evening
+    summary: 40,000 req/s, 90% video segments, metadata reads and uploads in the rest
+    scenario: {base_rps: 40000, static_ratio: 0.9, read_ratio: 0.7, cacheable: 0.9, working_set_gb: 8, query_column: video_id}
+    assertions:
+      - {metric: p99_ms, op: lte, value: 52}
+      - {metric: error_rate, op: lte, value: 0.5}
+  - id: premiere
+    name: A big creator premieres
+    summary: Traffic rises 70% for 30 seconds
+    hidden: true
+    scenario:
+      base_rps: 40000
+      static_ratio: 0.9
+      read_ratio: 0.7
+      cacheable: 0.9
+      working_set_gb: 8
+      query_column: video_id
+      spikes: [{at: 15, duration: 30, multiplier: 1.7, ramp: 4}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 77}
+      - {metric: error_rate, op: lte, value: 0.5}
+      - {metric: queue_lag_s, op: lte, value: 11}
+  - id: upload-surge
+    name: New Year's Eve upload surge
+    summary: Writes rise to 40% of dynamic traffic for the whole run
+    hidden: true
+    scenario: {base_rps: 40000, static_ratio: 0.9, read_ratio: 0.6, cacheable: 0.9, working_set_gb: 8, query_column: video_id}
+    assertions:
+      - {metric: error_rate, op: lte, value: 0.5}
+      - {metric: queue_lag_s, op: lte, value: 4}
+      - {metric: write_loss_rate, op: lte, value: 0}
+  - id: cold-metadata
+    name: New region, empty cache
+    summary: The metadata cache starts cold
+    hidden: true
+    scenario: {base_rps: 40000, static_ratio: 0.9, read_ratio: 0.7, cacheable: 0.9, working_set_gb: 8, query_column: video_id, cold_cache: true}
+    assertions:
+      - {metric: p99_ms, op: lte, value: 53}
+      - {metric: error_rate, op: lte, value: 0.5}
+
+hints:
+  - >-
+    Count where the work goes. 36,000 of the 40,000 requests per second are video segments, and each
+    one passes through an API server on its way from storage. Video segments are immutable files.
+    What component exists precisely to serve immutable files close to users, and where should it
+    fetch from on a miss?
+  - >-
+    Put a CDN in front of everything, with object storage as the origin for segments and the load
+    balancer behind it for API calls. Then look at the metadata database: ~2,800 reads/s and
+    ~1,200 writes/s land on it. Reads are cacheable; writes (uploads, likes, progress) do not need to
+    finish before the user gets a response.
+  - >-
+    Cache metadata with a long TTL and stampede protection (one hidden test starts with an empty
+    cache). Send writes through a queue to a fixed pool of workers: enough workers to keep up with
+    an upload surge, few enough that a premiere's burst of writes cannot push the primary past ~85%.
+
+editorial: |
+  ### 1. Requirements (5 minutes)
+  Split the problem early: **upload and processing** (write path, latency in minutes is fine),
+  **playback** (read path, latency in milliseconds, bandwidth in terabits), and **metadata**
+  (classic read-heavy service). Clarify: max upload size, which devices, live or VOD only (VOD
+  here), and whether recommendations are in scope (no).
+
+  ### 2. Estimation
+  - Watch: 1B hours/day × 3,600 s × ~3 Mbps ÷ 86,400 s ≈ **125 Tbps average**, ~400 Tbps peak.
+    No origin can serve that; the CDN must hit 95%+ and sit inside ISPs (Google Global Cache, Netflix
+    Open Connect).
+  - Segment requests: with 4 s segments, 125 Tbps ÷ 3 Mbps ≈ 40M concurrent streams → **10M segment
+    requests/s**.
+  - Upload: 500 h/min ≈ 30k hours/hour. At ~2 GB per raw hour that is ~1.4 PB/day of originals,
+    plus ~1.5x for renditions. Object storage, tiered to cold storage for the long tail.
+  - Transcoding: one hour of 1080p to a 6-rung ladder takes roughly 1–2 CPU-hours per rung, so
+    30k h/h of uploads needs **~200k–400k cores**. It is a batch fleet, not part of the API.
+  - Metadata: ~1M req/s globally, a few KB per video, hot set fits in RAM.
+
+  ### 3. High-level design
+  ```
+  upload:   client → API: create upload → pre-signed URL → resumable chunks straight to object storage
+            storage event → queue "process" → workers: validate, split into GOP chunks, transcode in
+            parallel (ladder × codecs), package HLS/DASH, thumbnails → write renditions to storage
+            → mark video READY in metadata DB
+  playback: player → API: manifest URL (signed) → CDN → object storage on miss → segments
+  metadata: client → CDN (short TTL) → API → Redis → DB (on miss); counts via async events
+  ```
+
+  ### 4. Deep dives
+  - **Upload pipeline.** Bytes never pass through the API: the client uploads chunks directly to
+    object storage using a pre-signed, resumable URL. The API only records intent and state
+    (`UPLOADING → PROCESSING → READY / FAILED`). Idempotent job ids so a retried event does not
+    transcode twice.
+  - **Transcoding.** Split the source at keyframes into ~10 s chunks, transcode chunks in parallel
+    across workers (a 2-hour film finishes in minutes), then stitch. Produce a bitrate ladder
+    (240p–4K) per codec (H.264 for reach, VP9/AV1 for efficiency on popular videos only, since AV1
+    encode is ~10x more expensive). Prioritise: publish 360p and 720p first, the rest later.
+  - **Adaptive bitrate.** Each rendition is cut into 2–6 s segments listed in a manifest (HLS
+    `.m3u8` or DASH `.mpd`). The player estimates throughput and buffer level and chooses the next
+    segment's rung. Shorter segments adapt faster but cost more requests and worse compression.
+  - **CDN strategy.** Segments are immutable: long cache TTL, content-addressed paths. Popular
+    videos are pushed to edge caches proactively; the long tail is served via a mid-tier cache
+    (origin shield) so that misses from hundreds of edges collapse into one origin fetch. Signed
+    URLs with expiry control access. Pay attention to the manifest: it is small and cacheable too.
+  - **Metadata and counts.** View counts are not incremented in the metadata row on every view: send
+    view events to a queue, aggregate, and update counts every few seconds.
+
+  ### 5. What the hidden tests probe
+  - **Premiere (+70%).** CDN absorbs the segment spike for free. Writes peak at ~2,000/s; four
+    medium workers drain ~1,500/s, so the queue holds the excess and processing runs ~9 s behind.
+    Without the queue those writes go straight to the primary and p99 jumps past 600 ms.
+  - **Upload surge.** Writes run at 1,600/s for the whole minute. Too few workers and the backlog
+    grows without bound.
+  - **Cold metadata cache.** A new region starts with an empty Redis. Stampede protection keeps the
+    database from taking the full read load while the cache warms.
+
+  ### 6. Common mistakes
+  - Uploading or streaming video bytes through application servers.
+  - Treating transcoding as a synchronous step of the upload request.
+  - One rendition per video ("we store the MP4"), so no adaptive streaming.
+  - Incrementing view counters with a database write per view.
+  - Ignoring CDN cost and the origin-shield layer when discussing a viral video.
+
+  ### 7. What good looks like
+  - **E4:** CDN + object storage for video, metadata DB with cache, async transcoding via a queue.
+  - **E5:** pre-signed resumable uploads, chunked parallel transcoding, bitrate ladder and ABR
+    manifests, origin shield, async counters, estimates for egress and storage.
+  - **E6:** per-title encoding and codec economics (AV1 only for hot content), ISP-embedded caches,
+    tiered storage and lifecycle policies, failure handling in the pipeline (poison videos, retries,
+    partial ladders), cost per hour watched as the key metric.
+
+design_prompt: |
+  Answer each in a few sentences or a short sketch. Use numbers where you can.
+
+  1. **Upload API and pipeline.** Define the endpoints a client uses to upload a 4 GB video over a
+     flaky mobile connection. Trace the video from the first byte to "watchable", naming each
+     component and the state stored at each step.
+  2. **Transcoding.** How do you turn one upload into renditions for every device, and how do you
+     make a two-hour video available in minutes rather than hours? Estimate the compute needed for
+     500 hours of uploads per minute.
+  3. **Adaptive bitrate playback.** Explain manifests, segments and how the player chooses quality.
+     What segment length would you pick and why?
+  4. **CDN strategy.** How do you serve ~125 Tbps on average? Cover cache keys and TTLs, what
+     happens when a new video goes viral (cold edges, origin protection), access control for
+     private videos, and the cost trade-offs.
+  5. **Metadata and counters.** Describe the data model for videos and channels, how the watch
+     page stays fast, and how you count billions of views per day without a write per view.

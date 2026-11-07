@@ -1,0 +1,171 @@
+slug: stampede-at-the-top-of-the-hour
+kind: lab
+title: Stampede at the top of the hour
+difficulty: medium
+day: 9
+summary: Every cached fare expires at the same second, and thousands of identical misses hit PostgreSQL at once. Coalesce the misses instead of buying a huge database.
+topics: [cache-stampede, thundering-herd, request-coalescing, caching]
+company_tags: [Expedia, Booking.com, Meta]
+estimated_minutes: 25
+incident: "SEV-2 · p99 > 700 ms every hour on the hour on GET /fares · PostgreSQL 127% at :00, 20% otherwise"
+
+brief_beginner: |
+  You run **Faretide**, a flight price search. Prices are stored in PostgreSQL, and because thousands
+  of people search the same routes, the API keeps a copy of each answer in a Redis cache. About
+  **98%** of searches are answered from Redis in under a millisecond, and the database idles at around
+  **20%** busy.
+
+  Except at the top of every hour. A pricing job refreshes all the fares at exactly :00 and gives each
+  one a one-hour expiry. So an hour later, **they all expire in the same second**. Thousands of
+  searches miss the cache at once, every one of them asks the database the same questions, and the
+  database is suddenly asked for about **127%** of what it can do. For a few seconds searches crawl.
+
+  Picture a bakery where every loaf on the shelf goes past its sell-by time at 9:00 sharp, and every
+  customer walks into the kitchen to ask the baker for a fresh one, all at once. A sensible bakery puts
+  one person in the kitchen to bake each kind of loaf while everyone else waits a moment at the
+  counter. That is **stampede protection**.
+
+  **Your job:** survive the top of the hour, and a Redis restart, without paying for a database
+  sized for a few seconds a day.
+
+brief_expert: |
+  5k rps, 95% reads, 95% of them cacheable, 3 GB hot set in a 4 GB Redis (TTL 3600 s, hit ratio ~98%).
+  PostgreSQL large sits at ~20%. At :00 a synchronised expiry drops the hit ratio to ~15% (recovers
+  with τ ≈ 4 s): ~3.8k identical misses/s fan out to the database, peaking at ~127% of capacity.
+  The backlog drains slowly and drives p99 into the high hundreds of ms.
+
+  Coalesce concurrent misses for the same key (single-flight / request coalescing) so the database
+  sees one fetch per key rather than one per request. Also plan for a full cold start (Redis restart,
+  τ ≈ 8 s) and for the expiry wave coinciding with a traffic spike. An xlarge database (or a replica)
+  absorbs it but does not fit the budget.
+
+glossary:
+  - term: Cache stampede
+    meaning: Many requests miss the cache at the same moment and all go to the database together. Also called a thundering herd.
+  - term: TTL
+    meaning: Time to live. How long a cached entry is kept before it expires and must be fetched again.
+  - term: Request coalescing
+    meaning: When many requests miss the same key, one of them fetches it from the database and the rest wait for that answer.
+  - term: TTL jitter
+    meaning: Adding a small random amount to each expiry so keys do not all expire at the same second.
+
+requirements:
+  - p99 latency under 58 ms, including the top of the hour
+  - Error rate under 0.2%
+  - Stay within $2.25/hr (an xlarge database does not fit)
+
+budget: 2.25
+palette: [load_balancer, app_server, cache, database]
+
+starter:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 120}}
+    - {id: lb, type: load_balancer, label: Load Balancer, position: {x: 240, y: 120}}
+    - {id: api, type: app_server, label: Fare Search API, config: {size: large, instances: 9}, position: {x: 480, y: 120}}
+    - {id: redis, type: cache, label: Redis, config: {memory_gb: "4", ttl_s: 3600, stampede_protection: false}, position: {x: 720, y: 40}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: large, indexes: "id, slug"}, position: {x: 720, y: 200}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: redis}
+    - {source: api, target: db}
+
+solution:
+  nodes:
+    - {id: users, type: users, position: {x: 0, y: 120}}
+    - {id: lb, type: load_balancer, label: Load Balancer, position: {x: 240, y: 120}}
+    - {id: api, type: app_server, label: Fare Search API, config: {size: large, instances: 9}, position: {x: 480, y: 120}}
+    - {id: redis, type: cache, label: Redis, config: {memory_gb: "4", ttl_s: 3600, stampede_protection: true}, position: {x: 720, y: 40}}
+    - {id: db, type: database, label: PostgreSQL, config: {size: large, indexes: "id, slug"}, position: {x: 720, y: 200}}
+  edges:
+    - {source: users, target: lb}
+    - {source: lb, target: api}
+    - {source: api, target: redis}
+    - {source: api, target: db}
+
+tests:
+  - id: top-of-hour
+    name: The top of the hour
+    summary: 5,000 req/s; every cached fare expires at t=30s
+    scenario:
+      base_rps: 5000
+      read_ratio: 0.95
+      cacheable: 0.95
+      working_set_gb: 3
+      query_column: slug
+      events: [{at: 30, type: ttl_expiry_wave, label: "14:00:00 — the hourly fare batch's keys all expired at once"}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 58}
+      - {metric: error_rate, op: lte, value: 0.2}
+  - id: redis-restart
+    name: Redis restarts
+    summary: The cache comes back completely empty at t=25s
+    hidden: true
+    scenario:
+      base_rps: 5000
+      read_ratio: 0.95
+      cacheable: 0.95
+      working_set_gb: 3
+      query_column: slug
+      events: [{at: 25, type: cache_flush}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 60}
+      - {metric: error_rate, op: lte, value: 0.5}
+  - id: sale-at-the-hour
+    name: Flash sale at the top of the hour
+    summary: Traffic rises 30% and the hourly expiry hits in the middle of it
+    hidden: true
+    scenario:
+      base_rps: 5000
+      read_ratio: 0.95
+      cacheable: 0.95
+      working_set_gb: 3
+      query_column: slug
+      spikes: [{at: 20, duration: 30, multiplier: 1.3, ramp: 4}]
+      events: [{at: 30, type: ttl_expiry_wave}]
+    assertions:
+      - {metric: p99_ms, op: lte, value: 90}
+      - {metric: error_rate, op: lte, value: 0.5}
+
+hints:
+  - Run the test and look at the latency chart and the logs. Everything is calm except for a few seconds. What happened to Redis at that moment, and what did PostgreSQL see?
+  - The database is not too small for a normal day; it is too small for thousands of identical misses arriving in the same second. Most of those misses are asking for the same few keys. Look at the cache's resilience settings.
+  - Turn on stampede protection on Redis (request coalescing). One request per key goes to the database and the rest wait for its answer, which cuts the miss storm by up to 75% while the cache refills. Then think about a full Redis restart, which is a longer and colder version of the same event.
+
+editorial: |
+  ### Why it broke
+  On a normal second Redis answers ~98% of fare lookups and PostgreSQL (large, 3,500 qps) handles
+  ~70 misses, ~240 uncacheable reads and ~250 writes: about **20%** busy. Then the hourly expiry hits.
+  The hit ratio drops to ~15% and about **3,800 misses/s** arrive at once, nearly all for the same
+  popular routes. The database is asked for ~4,450 units/s, **127%** of capacity. A queue builds, and
+  because the cache refills only as those slow queries complete, the backlog takes seconds to drain.
+  p99 for the whole run lands near **790 ms**, from a few bad seconds.
+
+  ### The fix: coalesce the misses
+  ```
+  GET fare:LHR-JFK  → miss
+     first request  → acquires the per-key lock → SELECT … → SET fare:LHR-JFK → releases
+     other requests → wait a few ms for that value (no database call)
+  ```
+  With stampede protection on, the database peaks at about **61%** during the wave. p99 drops to about
+  **49 ms** with no errors, at the same cost (**$2.04/hr**). No extra hardware at all.
+
+  ### The trap: a fully cold cache
+  An expiry wave is a partial, fast-recovering stampede. A **Redis restart** is the full version: every
+  key is gone and refilling takes longer. Without coalescing it fails ~1.7% of requests and p99 goes past
+  a second. With it, p99 stays near 50 ms. The flash-sale test lands the wave on top of 30% more traffic;
+  the protected design peaks near 80% busy and holds at ~76 ms p99.
+
+  ### Alternatives
+  * **An xlarge database** absorbs the herd (p99 ≈ 49 ms) for **$2.41/hr**, paying all day for a few
+    seconds an hour. A read replica costs the same and is also over budget.
+  * **TTL jitter** (expire each key at 3600 s ± a few minutes) stops the keys expiring together. It is
+    the right fix at the source, but does nothing for a Redis restart.
+  * **Probabilistic early refresh** (refresh a hot key slightly before it expires) or **serving stale
+    while revalidating** keep the old value available while one worker fetches the new one.
+  * **More Redis memory** does not help: the problem is *when* keys expire, not how many fit.
+
+  ### Interview takeaway
+  Whenever you add a cache, ask what the database sees when the cache is empty or a big batch of keys
+  expires at once. Standard answers: request coalescing (single-flight), TTL jitter, early or background
+  refresh, and warming the cache before it takes traffic.
